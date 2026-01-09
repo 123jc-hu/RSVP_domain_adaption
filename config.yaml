@@ -1,0 +1,4 @@
+model: EEGNet
+n_channels: 62
+fs: 128
+n_class: 2
