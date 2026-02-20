@@ -113,7 +113,7 @@ def build_config(model_name, dataset_name=None):
         if f in merged_config:
             merged_config[f] = int(merged_config[f])
 
-    float_fields = ["learning_rate", "weight_decay", "selector_beta_start", "selector_beta_end", "selector_orth"]
+    float_fields = ["learning_rate", "weight_decay"]
     for f in float_fields:
         if f in merged_config:
             merged_config[f] = float(merged_config[f])
@@ -123,8 +123,6 @@ def build_config(model_name, dataset_name=None):
         "use_gpu",
         "data_mix",
         "log_runtime",
-        "use_selector",
-        "selector_per_sample",
         "class_weighted_ce",
         "use_target_stream",
     ]

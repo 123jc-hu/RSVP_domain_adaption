@@ -63,20 +63,15 @@ datasets:
 models:
   DeepConvNet:
     learning_rate: 0.00005
-    train_algorithm: ce
 
   EEGNet:
     learning_rate: 0.001
-    train_algorithm: ce
 
   PLNet:
     learning_rate: 0.001
-    train_algorithm: ce
 
   EEGInception:
     learning_rate: 0.0001
-    train_algorithm: ce
 
   PPNN:
     learning_rate: 0.0001
-    train_algorithm: ce

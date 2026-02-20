@@ -14,7 +14,6 @@ def main(config):
     experiment.run_experiment()
 
     logger.info("Finished training and testing!")
-    logger.info(f"Selected K: {config.get('selector_K', 'N/A')}")
     logger.info(f"Elapsed time: {(time.time() - start_time) / 60:.2f} minutes \n")
 
 
