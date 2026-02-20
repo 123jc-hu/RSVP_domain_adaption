@@ -34,9 +34,8 @@ if __name__ == '__main__':
         "MOCNN", "lightweight_erp",
     ]
     train_mode = [
-        'single-subject',
-        # 'cross-subject',
-        ]
+        'cross-subject',
+    ]
 
     for mode in train_mode:
 

@@ -7,7 +7,7 @@ epochs: 200
 weight_decay: 0.0001
 patience: 10
 use_gpu: True
-train_mode: single-subject      # single-subject / cross-subject
+train_mode: cross-subject       # cross-subject only
 data_mix: True
 
 log_runtime: true           # 是否收集并记录动态指标

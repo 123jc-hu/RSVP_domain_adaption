@@ -27,8 +27,7 @@ if __name__ == '__main__':
         "GSS",
     ]
     train_mode = [
-        'single-subject',
-        # 'cross-subject'
+        'cross-subject'
     ]
     K = 24
 

@@ -79,6 +79,8 @@ def build_config(model_name, dataset_name=None):
     merged_config = {**shared_config, **model_specific, **dataset_specific}
     merged_config["model"]   = model_name
     merged_config["dataset"] = dataset_name
+    # Domain adaptation experiments are cross-subject only.
+    merged_config["train_mode"] = "cross-subject"
 
     # --- n_fold 兼容解析：None / 'None' / '' 都视为 None，其他转 int
     n_fold_val = merged_config.get("n_fold", None)
@@ -108,9 +110,6 @@ def build_config(model_name, dataset_name=None):
             merged_config[f] = bool(merged_config[f])
     
     if merged_config["model"] == "LMDANet":
-        if merged_config['train_mode'] == 'single-subject':
-            merged_config["lmda_avgpool"] = merged_config["fs"] // 10
-        elif merged_config['train_mode'] == 'cross-subject':
-            merged_config["lmda_avgpool"] = 1
+        merged_config["lmda_avgpool"] = 1
 
     return merged_config

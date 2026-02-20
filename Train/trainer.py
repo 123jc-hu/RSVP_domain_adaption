@@ -15,7 +15,7 @@ import time as _t
 from pathlib import Path
 import os
 import re
-from Data.datamodule import RandomDomainSampler, BalancedRandomDomainSampler, EEGDataModuleSingleSubject, EEGDataModuleCrossSubject, make_zero_channel_dataloader
+from Data.datamodule import EEGDataModuleCrossSubject
 from Utils.config import set_random_seed
 from Utils.utils import (load_from_checkpoint, EarlyStopping, SaveBestValBA, 
                          split_source_target_indices, compute_plv_attention_vector)
@@ -67,7 +67,7 @@ class OptimizedExperimentRunner:
         self.log = main_logger
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.exp_dir = self._setup_exp_dir()
-        self.datamodule = EEGDataModuleSingleSubject(self.config) if self.config["train_mode"] == "single-subject" else EEGDataModuleCrossSubject(self.config)
+        self.datamodule = EEGDataModuleCrossSubject(self.config)
 
         # 缓存初始权重模板
         self._init_state_cache: Dict[tuple, Dict[str, torch.Tensor]] = {}
@@ -206,24 +206,14 @@ class OptimizedExperimentRunner:
                     continue
                 subject_id = int(m.group(1))
 
-                # === 关键分支：按 train_mode 选择 prepare_data 的参数 ===
-                if self.config["train_mode"] == "single-subject":
-                    # 单被试：传入单文件路径（与你的 EEGDataModuleSingleSubject.prepare_data 签名对齐）
-                    self.datamodule.prepare_data(
-                        test_subject_id=subject_id,
-                        data_path=str(base_dir / fname),
-                        indices_path=indices_path,
-                        mode="normal",
-                    )
-                else:
-                    # 跨被试（LOSO）：传入完整 subject→file 映射（与你的 EEGDataModuleCrossSubject.prepare_data 签名对齐）
-                    self.datamodule.prepare_data(
-                        test_subject_id=subject_id,
-                        subject_file_map=subject_file_map,
-                        indices_path=indices_path,
-                        mode="normal",
-                        train_range=self.config.get("train_range", "train"),  # "train" 或 "all"
-                    )
+                # Cross-subject LOSO only.
+                self.datamodule.prepare_data(
+                    test_subject_id=subject_id,
+                    subject_file_map=subject_file_map,
+                    indices_path=indices_path,
+                    mode="normal",
+                    train_range=self.config.get("train_range", "train"),  # "train" or "all"
+                )
 
                 # 训练 + 评估（内部会 self.datamodule.setup(...)）
                 metrics = self._run_subject(subject_id)
@@ -367,8 +357,8 @@ class OptimizedExperimentRunner:
         # )
 
         # train_loader = self.datamodule.train_dataloader(batch_size=batch_size, sampler=sampler)
-        train_loader = self.datamodule.train_dataloader(batch_size=batch_size, add_zero_channel=True)
-        val_loader   = self.datamodule.val_dataloader(batch_size=batch_size, add_zero_channel=True)
+        train_loader = self.datamodule.train_dataloader(batch_size=batch_size)
+        val_loader   = self.datamodule.val_dataloader(batch_size=batch_size)
         # print(f"  Training samples: {len(ds)} val samples: {len(self.datamodule.val_dataset)}")
 
         # train_loader = make_zero_channel_dataloader(train_loader, shuffle=True, add_zero_channel=False, random_seed=2025)
@@ -470,7 +460,7 @@ class OptimizedExperimentRunner:
             self.log.info(f"subject={subj} selected channels: {indices}")
 
         # 常规评估
-        test_loader = self.datamodule.test_dataloader(batch_size=int(self.config.get("test_batch_size", 1000)), add_zero_channel=True)
+        test_loader = self.datamodule.test_dataloader(batch_size=int(self.config.get("test_batch_size", 1000)))
         # test_loader = make_zero_channel_dataloader(test_loader, shuffle=False, add_zero_channel=False, random_seed=2025)
 
 
