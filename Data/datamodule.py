@@ -150,6 +150,7 @@ class EEGDataModuleCrossSubject:
         self.test_dataset = None
         self.target_unlabeled_dataset = None
         self.source_subject_keys: List[str] = []
+        self.source_train_class_counts: Optional[np.ndarray] = None
 
     def prepare_data(
         self,
@@ -195,6 +196,8 @@ class EEGDataModuleCrossSubject:
 
         source_train_parts: List[Dataset] = []
         source_val_parts: List[Dataset] = []
+        n_class = int(self.config.get("n_class", 2))
+        class_counts = np.zeros(n_class, dtype=np.int64)
         for sub_key in self.source_subject_keys:
             n = self._subject_len(sub_key)
             all_idx = np.arange(n, dtype=np.int64)
@@ -205,9 +208,12 @@ class EEGDataModuleCrossSubject:
             )
             source_train_parts.append(NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=tr_idx))
             source_val_parts.append(NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=va_idx))
+            labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
+            class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
 
         self.train_dataset = ConcatDataset(source_train_parts)
         self.val_dataset = ConcatDataset(source_val_parts)
+        self.source_train_class_counts = class_counts
 
         target_n = self._subject_len(held_out)
         target_idx = np.arange(target_n, dtype=np.int64)
@@ -262,7 +268,7 @@ class EEGDataModuleCrossSubject:
         )
 
     def _subject_len(self, sub_key: str) -> int:
-        y = np.load(self.subject_file_map[sub_key], mmap_mode="r")["y_data"]
+        y = self._load_subject_labels(self.subject_file_map[sub_key])
         return int(y.shape[0])
 
     def _split_indices_for_subject(
@@ -275,7 +281,7 @@ class EEGDataModuleCrossSubject:
         if indices.size <= 1:
             return indices, np.empty(0, dtype=np.int64)
 
-        labels = np.load(subject_file, mmap_mode="r")["y_data"][indices]
+        labels = self._load_subject_labels(subject_file)[indices]
         labels = np.asarray(labels).reshape(-1)
         rng = np.random.default_rng(self.seed)
 
@@ -310,3 +316,38 @@ class EEGDataModuleCrossSubject:
         if val_idx.size > 0:
             val_idx = val_idx[rng.permutation(val_idx.shape[0])]
         return train_idx, val_idx
+
+    def source_class_weights(self, n_class: Optional[int] = None) -> np.ndarray:
+        if self.source_train_class_counts is None:
+            raise RuntimeError("Call setup() before requesting source class weights.")
+        if n_class is None:
+            n_class = int(self.config.get("n_class", len(self.source_train_class_counts)))
+        counts = self.source_train_class_counts.astype(np.float64)
+        if counts.shape[0] < n_class:
+            counts = np.pad(counts, (0, n_class - counts.shape[0]), mode="constant")
+        counts = counts[:n_class]
+        total = float(np.sum(counts))
+        weights = np.zeros(n_class, dtype=np.float32)
+        nonzero = counts > 0
+        if total > 0 and np.any(nonzero):
+            weights[nonzero] = (total / float(n_class)) / counts[nonzero]
+            mean_w = float(np.mean(weights[nonzero]))
+            if mean_w > 0:
+                weights[nonzero] = weights[nonzero] / mean_w
+        return weights
+
+    def source_class_weight_tensor(
+        self, n_class: Optional[int] = None, device: Optional[torch.device] = None
+    ) -> torch.Tensor:
+        w = self.source_class_weights(n_class=n_class)
+        t = torch.tensor(w, dtype=torch.float32)
+        if device is not None:
+            t = t.to(device)
+        return t
+
+    @staticmethod
+    def _load_subject_labels(subject_file: str) -> np.ndarray:
+        cache_dir = NPZMemmapSubsetDataset._ensure_npz_cache(
+            Path(subject_file), ["y_data.npy"]
+        )
+        return np.load(cache_dir / "y_data.npy", mmap_mode="r")

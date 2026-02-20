@@ -4,7 +4,7 @@ import copy
 import torch
 import pandas as pd
 
-from Utils.config import load_config
+from Utils.config import build_config
 from Models.eeg_models import model_dict
 
 # =============== 基础工具 / Basic utilities ===============
@@ -325,14 +325,15 @@ def benchmark_one(model_name, base_config, input_shape):
 # =============== 主程序 / Main ===============
 if __name__ == "__main__":
     input_shape = (1, 1, 62, 128)
-    base_config = load_config("config.yaml")
+    base_config = build_config("EEGNet")
 
     # 你要批量测的模型列表 / models to benchmark
     model_list = [
-        "DeepConvNet", "EEGNet", "EEGInception",
-        "PLNet", "PPNN", "TSCAE",
-        "MOCNN", "lightweight_erp",
-        "Ours_new"
+        "DeepConvNet",
+        "EEGNet",
+        "EEGInception",
+        "PLNet",
+        "PPNN",
     ]
 
     results = []

@@ -6,8 +6,6 @@ sys.path.append(str(project_root))
 from Models.EEGNet import Conv2dWithConstraint, DenseWithConstraint, calculate_outsize
 import torch
 from torch import nn
-from torchinfo import summary
-from Utils.config import load_config
 
 
 class Model(nn.Module):
@@ -104,7 +102,10 @@ class Model(nn.Module):
 
 
 if __name__ == '__main__':
-    config_path = "config.yaml"
+    from torchinfo import summary
+    from Utils.config import load_config
+
+    config_path = "Configs/config.yaml"
     args = load_config(config_path)
     model = Model(args)
     input_shape = (1, 1, 62, 128)

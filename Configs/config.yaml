@@ -1,19 +1,19 @@
-model: Ours
-is_training: True
+model: EEGNet
+is_training: true
 random_seed: 2024
 dataset: THU
-n_fold: None
+n_fold: null
 epochs: 200
 weight_decay: 0.0001
 patience: 10
-use_gpu: True
-train_mode: cross-subject       # cross-subject only
-data_mix: True
+use_gpu: true
+train_mode: cross-subject
+data_mix: true
+class_weighted_ce: true
 
-log_runtime: true           # 是否收集并记录动态指标
-rt_deadline_ms: 200.0       # 实时系统的端到端时延阈值（用于 Miss Rate）
+log_runtime: true
+rt_deadline_ms: 200.0
 
-# Dataset-specific constants
 datasets:
   THU:
     sub_num: 64
@@ -58,7 +58,6 @@ datasets:
     n_class: 2
     batch_size: 32
 
-# Model-specific overrides
 models:
   DeepConvNet:
     learning_rate: 0.00005
@@ -67,243 +66,15 @@ models:
   EEGNet:
     learning_rate: 0.001
     train_algorithm: ce
-  
-  EEGNet_OGS:
-    use_selector: True
+
+  PLNet:
     learning_rate: 0.001
-    selector_lr: 0.01
-    train_algorithm: dup
-    selector_K: 32
-    selector_beta_start: 5.0
-    selector_beta_end: 0.01
-    selector_tau_start: 1.20      # 起点宽松些，不至于太早干预
-    selector_tau_end:   0.98      # 末值略低于 1，确保触发
-    selector_T: 50
-    selector_dup: 0.1
-    selector_per_sample: True
-    selector_entropy_thresh: 0.7
-    selector_entropy_patience: 3
+    train_algorithm: ce
 
   EEGInception:
     learning_rate: 0.0001
     train_algorithm: ce
-  
-  PLNet:
-    learning_rate: 0.001
-    train_algorithm: ce
-  
-  PLNet_OGS:
-    use_selector: True
-    learning_rate: 0.001
-    selector_lr: 0.01
-    train_algorithm: dup
-    selector_K: 32
-    selector_beta_start: 5.0
-    selector_beta_end: 0.01
-    selector_tau_start: 1.20      # 起点宽松些，不至于太早干预
-    selector_tau_end:   0.98      # 末值略低于 1，确保触发
-    selector_T: 50
-    selector_dup: 0.1
-    selector_per_sample: True
-    selector_entropy_thresh: 0.7
-    selector_entropy_patience: 3
-  
+
   PPNN:
     learning_rate: 0.0001
     train_algorithm: ce
-  
-  PPNN_OGS:
-    learning_rate: 0.0001
-    train_algorithm: gumbel
-    use_selector: True
-    selector_K: 32              
-    selector_beta_start: 5.0    
-    selector_beta_end: 0.1
-    selector_T: 50
-    selector_orth: 0.5
-    selector_lr: 0.01
-    selector_per_sample: False
-  
-  EEGConformer:
-    learning_rate: 0.00005
-    train_algorithm: ce
-  
-  EEGDeformer:
-    learning_rate: 0.00001
-    train_algorithm: ce
-  
-  TSformer-SA:
-    learning_rate: 0.00005
-    train_algorithm: TSformer_SA
-  
-  CRE-TSCAE:
-    learning_rate: 0.0005
-    train_algorithm: CRE_TSCAE
-  
-  AdaptEEG:
-    learning_rate: 0.0001
-    train_algorithm: AdaptEEG
-  
-  SDDA:
-    learning_rate: 0.0001
-    train_algorithm: SDDA
-  
-  SCLDGN:
-    learning_rate: 0.001
-    train_algorithm: SCLDGN
-
-  Ours:
-    learning_rate: 0.001
-    train_algorithm: ce
-  
-  Ours_light:
-    learning_rate: 0.001
-    train_algorithm: gumbel
-    use_selector: True
-    selector_K: 32              
-    selector_beta_start: 5.0    
-    selector_beta_end: 0.1
-    selector_T: 50
-    selector_orth: 1
-    selector_lr: 0.01
-    selector_per_sample: False
-  
-  Ours_light_without_K:
-    learning_rate: 0.001
-    train_algorithm: ce
-  
-  Ours_light_with_K:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 16
-
-  Ours_light_reg:
-    use_selector: True
-    learning_rate: 0.001
-    selector_lr: 0.01
-    train_algorithm: dup
-    selector_K: 32
-    selector_beta_start: 5.0
-    selector_beta_end: 0.01
-    selector_tau_start: 1.20      # 起点宽松些，不至于太早干预
-    selector_tau_end:   0.98      # 末值略低于 1，确保触发
-    selector_T: 50
-    selector_dup: 0.1
-    selector_per_sample: True
-    selector_entropy_thresh: 0.7
-    selector_entropy_patience: 3
-  
-  lightweight_erp:
-    learning_rate: 0.001
-    train_algorithm: ce
-  SST_DPN:
-    learning_rate: 0.001
-    train_algorithm: ce
-  LMDANet:
-    learning_rate: 0.001
-    train_algorithm: ce
-  LENet:
-    learning_rate: 0.001
-    train_algorithm: ce
-  1DCNN_BiLSTM:
-    learning_rate: 0.001
-    train_algorithm: ce
-  
-  Correlation-based Selection:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  Frequency-Domain Weighting:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  SparseEA:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  Gumbel-Softmax Selector:
-    learning_rate: 0.001
-    train_algorithm: gumbel
-    use_selector: True
-    selector_K: 8              
-    selector_beta_start: 5.0    
-    selector_beta_end: 0.1
-    selector_T: 50
-    selector_orth: 0
-    selector_lr: 0.01
-    selector_per_sample: False
-
-  adaptive_ours_light:
-    learning_rate: 0.001
-    train_algorithm: gumbel
-    use_selector: True
-    selector_K: 16              
-    selector_beta_start: 5.0    
-    selector_beta_end: 0.1
-    selector_T: 50
-    selector_orth: 1
-    selector_lr: 0.01
-    selector_per_sample: False
-  
-  Ours_new:
-    learning_rate: 0.001
-    train_algorithm: ce
-  
-  Ours_ZOS:
-    learning_rate: 0.001
-    train_algorithm: gumbel
-    use_selector: True
-    selector_K: 8              
-    selector_beta_start: 5.0    
-    selector_beta_end: 0.1
-    selector_T: 25
-    selector_orth: 1
-    selector_lr: 0.01
-    selector_per_sample: False
-  
-  Correlation_new:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  Frequency_new:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  SparseEA_new:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  ABMOHS:
-    learning_rate: 0.001
-    train_algorithm: ce
-    selector_K: 32
-  
-  TSCAE:
-    learning_rate: 0.0005
-    train_algorithm: ce
-  
-  MOCNN:
-    learning_rate: 0.0001
-    train_algorithm: ce
-  
-  GSS:
-    use_selector: True
-    learning_rate: 0.001
-    selector_lr: 0.01
-    train_algorithm: dup
-    selector_K: 32
-    selector_beta_start: 5.0
-    selector_beta_end: 0.01
-    selector_tau_start: 1.20      # 起点宽松些，不至于太早干预
-    selector_tau_end:   0.98      # 末值略低于 1，确保触发
-    selector_T: 50
-    selector_dup: 0.1
-    selector_per_sample: True
-    selector_entropy_thresh: 0.7
-    selector_entropy_patience: 3

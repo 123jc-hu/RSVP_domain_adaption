@@ -109,7 +109,4 @@ def build_config(model_name, dataset_name=None):
         if f in merged_config:
             merged_config[f] = bool(merged_config[f])
     
-    if merged_config["model"] == "LMDANet":
-        merged_config["lmda_avgpool"] = 1
-
     return merged_config

@@ -7,9 +7,6 @@ sys.path.append(str(project_root))
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torchinfo import summary
-from Utils.config import load_config
-from Utils.utils import compute_hilbert_components
 
 
 class Conv2dWithConstraint(nn.Conv2d):
@@ -136,7 +133,10 @@ class Model(nn.Module):
 
 
 if __name__ == '__main__':
-    config_path = "config.yaml"
+    from torchinfo import summary
+    from Utils.config import load_config
+
+    config_path = "Configs/config.yaml"
     args = load_config(config_path)
     model = Model(args)
     input_shape = (1, 1, 62, 128)

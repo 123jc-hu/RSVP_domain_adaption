@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 from Utils.config import load_config, Logger, build_config
 from Train.trainer import OptimizedExperimentRunner
@@ -9,12 +9,12 @@ def main(config):
     logger = Logger(config["model"]).get_logger()
     logger.info(f'Starting training for model: {config["model"]}')
 
-    # 初始化实验运行器
+    # 鍒濆鍖栧疄楠岃繍琛屽櫒
     experiment = OptimizedExperimentRunner(config, logger)
 
     logger.info(f"\n================ Running Dataset: {config['dataset']} ================\n")
 
-    # 执行完整实验流程
+    # 鎵ц瀹屾暣瀹為獙娴佺▼
     experiment.run_experiment()
     
     logger.info("Finished training and testing!")
@@ -25,9 +25,9 @@ def main(config):
 if __name__ == '__main__':
     # for i in [5, 10, 15, 20]:
     #     for index in range(10):
-    #         config = build_config("Ours_light_reg")  # 默认只跑 Ours 模型
+    #         config = build_config("Ours_light_reg")  # 榛樿鍙窇 Ours 妯″瀷
     #         config["masked_num_channels"] = i
     #         config["mask_index"] = index
     #         main(config)
-    config = build_config("Ours_ZOS")  # 默认只跑 Ours 模型
+    config = build_config("EEGNet")  # 榛樿鍙窇 Ours 妯″瀷
     main(config)

@@ -5,8 +5,6 @@ sys.path.append(str(project_root))
 
 import torch
 from torch import nn
-from torchinfo import summary
-from Utils.config import load_config
 
 
 class Model(nn.Module):
@@ -105,6 +103,8 @@ class Model(nn.Module):
 
 
 if __name__ == '__main__':
+    from torchinfo import summary
+
     args = {"n_channels": 62, "fs": 128, "n_class": 2, "seq_len": 128}
     model = Model(args)
     input_shape = (1, 1, args["n_channels"], args["seq_len"])  # 输入形状 (batch_size, n_channels, seq_len)

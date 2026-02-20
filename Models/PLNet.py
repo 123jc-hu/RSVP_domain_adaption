@@ -6,10 +6,19 @@ sys.path.append(str(project_root))
 
 from torch import nn
 from Models.EEGNet import Conv2dWithConstraint, DenseWithConstraint, calculate_outsize
-from einops.layers.torch import Rearrange
 import torch
-from torchinfo import summary
-from Utils.config import load_config
+
+
+class _RearrangeBKCToBTCK(nn.Module):
+    def forward(self, x):
+        # (B, K, C, T) -> (B, T, C, K)
+        return x.permute(0, 3, 2, 1).contiguous()
+
+
+class _RearrangeBTCKToBKCT(nn.Module):
+    def forward(self, x):
+        # (B, T, C, K) -> (B, K, C, T)
+        return x.permute(0, 3, 2, 1).contiguous()
 
 
 class Model(nn.Module):
@@ -37,7 +46,7 @@ class Model(nn.Module):
         )
 
         Block2 = nn.Sequential(
-            Rearrange("b k c t -> b t c k"),
+            _RearrangeBKCToBTCK(),
             Conv2dWithConstraint(
                 25,
                 25,
@@ -47,7 +56,7 @@ class Model(nn.Module):
                 bias=False,
                 groups=25,
             ),
-            Rearrange("b t c k -> b k c t"),
+            _RearrangeBTCKToBKCT(),
             nn.BatchNorm2d(8),
             nn.ELU(),
             nn.Dropout2d(p=0.25)
@@ -98,7 +107,10 @@ class Model(nn.Module):
 
 
 if __name__ == '__main__':
-    config_path = "config.yaml"
+    from torchinfo import summary
+    from Utils.config import load_config
+
+    config_path = "Configs/config.yaml"
     args = load_config(config_path)
     model = Model(args)
     input_shape = (1, 1, 62, 128)
