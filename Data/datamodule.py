@@ -231,12 +231,9 @@ class EEGDataModuleCrossSubject:
         assert self.train_dataset is not None, "Call setup() first."
         assert self.target_unlabeled_dataset is not None, "Call setup() first."
 
-        source_loader = DataLoader(
-            self.train_dataset,
+        source_loader = self.source_train_dataloader(
             batch_size=batch_size,
-            shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=0,
             drop_last=drop_last,
         )
         tb = int(target_batch_size) if target_batch_size is not None else int(batch_size)
@@ -248,6 +245,23 @@ class EEGDataModuleCrossSubject:
             drop_last=False,
         )
         return DualStreamDataLoader(source_loader, target_loader, cycle_target=True)
+
+    def source_train_dataloader(
+        self,
+        batch_size: int = 32,
+        sampler=None,
+        drop_last: bool = True,
+    ) -> DataLoader:
+        """Source-only supervised loader for baseline training."""
+        assert self.train_dataset is not None, "Call setup() first."
+        return DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=(sampler is None),
+            sampler=sampler,
+            num_workers=0,
+            drop_last=drop_last,
+        )
 
     def val_dataloader(self, batch_size: int = 64) -> DataLoader:
         assert self.val_dataset is not None, "Call setup() first."

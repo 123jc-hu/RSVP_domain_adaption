@@ -10,6 +10,8 @@ use_gpu: true
 train_mode: cross-subject
 data_mix: true
 class_weighted_ce: true
+use_target_stream: false
+dataset_root: E:/learning_projects/few-shot-learning_RSVP/Dataset
 
 log_runtime: true
 rt_deadline_ms: 200.0

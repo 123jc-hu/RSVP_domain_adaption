@@ -7,6 +7,20 @@ import yaml
 from argparse import Namespace
 import logging
 
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "y", "on"):
+            return True
+        if v in ("false", "0", "no", "n", "off"):
+            return False
+    return bool(value)
+
 def load_config(config_path):
     """从 yaml 文件中加载配置"""
     with open(config_path, 'r', encoding="utf-8") as file:
@@ -104,9 +118,18 @@ def build_config(model_name, dataset_name=None):
         if f in merged_config:
             merged_config[f] = float(merged_config[f])
 
-    bool_fields = ["is_training", "use_gpu", "data_mix", "log_runtime", "use_selector", "selector_per_sample"]
+    bool_fields = [
+        "is_training",
+        "use_gpu",
+        "data_mix",
+        "log_runtime",
+        "use_selector",
+        "selector_per_sample",
+        "class_weighted_ce",
+        "use_target_stream",
+    ]
     for f in bool_fields:
         if f in merged_config:
-            merged_config[f] = bool(merged_config[f])
+            merged_config[f] = _to_bool(merged_config[f])
     
     return merged_config

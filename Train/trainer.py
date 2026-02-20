@@ -17,8 +17,7 @@ import os
 import re
 from Data.datamodule import EEGDataModuleCrossSubject
 from Utils.config import set_random_seed
-from Utils.utils import (load_from_checkpoint, EarlyStopping, SaveBestValBA, 
-                         split_source_target_indices, compute_plv_attention_vector)
+from Utils.utils import load_from_checkpoint, EarlyStopping, SaveBestValBA
 from Utils.metrics import calculate_metrics, cal_F1_score
 # from Models.eeg_models import model_dict
 # from Models.embedded_selectors import build_model
@@ -274,7 +273,12 @@ class OptimizedExperimentRunner:
         ?10band ?
         """
         cfg = self.config
-        root = Path("E:/learning_projects/few-shot-learning_RSVP/Dataset")
+        root = Path(
+            cfg.get(
+                "dataset_root",
+                os.environ.get("RSVP_DATASET_ROOT", "E:/learning_projects/few-shot-learning_RSVP/Dataset"),
+            )
+        )
         if "_" in cfg["dataset"]:
             dataset, task = cfg["dataset"].split("_")
             return root / dataset / f"Standard_{cfg['fs']}Hz" / f"task{task}"
@@ -340,11 +344,10 @@ class OptimizedExperimentRunner:
         return self._eval(trainer, ckpt_dir)
 
     def _train(self, trainer):
-        """ + dataloader + fit"""
+        """Build dataloaders and run fit()."""
         cfg = self.config
 
         batch_size = int(cfg["batch_size"])
-        ds = self.datamodule.train_dataset
 
         # domain-aware sampler??
         # sampler = None
@@ -358,8 +361,11 @@ class OptimizedExperimentRunner:
         #     domain_labels=doms_np
         # )
 
-        # train_loader = self.datamodule.train_dataloader(batch_size=batch_size, sampler=sampler)
-        train_loader = self.datamodule.train_dataloader(batch_size=batch_size)
+        use_target_stream = bool(cfg.get("use_target_stream", False))
+        if use_target_stream:
+            train_loader = self.datamodule.train_dataloader(batch_size=batch_size)
+        else:
+            train_loader = self.datamodule.source_train_dataloader(batch_size=batch_size)
         val_loader   = self.datamodule.val_dataloader(batch_size=batch_size)
         # print(f"  Training samples: {len(ds)} val samples: {len(self.datamodule.val_dataset)}")
 
