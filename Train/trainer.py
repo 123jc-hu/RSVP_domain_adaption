@@ -17,10 +17,11 @@ import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from Data.datamodule import EEGDataModuleCrossSubject
+from Train.hyr_dpa_framework import HyRDPAScaffold
 from Utils.config import set_random_seed
 from Utils.utils import load_from_checkpoint, EarlyStopping, SaveBestValBA
 from Utils.metrics import calculate_metrics, cal_F1_score
-from Models.eeg_models import model_dict
+from Models.model_registry import model_dict
 
 
 
@@ -53,12 +54,15 @@ class OptimizedExperimentRunner:
     def __init__(self, config: Dict[str, Any], main_logger: logging.Logger):
         self.config = config
         self.log = main_logger
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_gpu = bool(config.get("use_gpu", True))
+        self.device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
         self.exp_dir = self._setup_exp_dir()
         self.datamodule = EEGDataModuleCrossSubject(self.config)
+        self.hyr_dpa = HyRDPAScaffold(self.config, self.log)
 
         self._init_state_cache: Dict[tuple, Dict[str, torch.Tensor]] = {}
         self.runtime_records: List[Dict[str, Any]] = []
+        self.source_selection_records: List[Dict[str, Any]] = []
 
     def _setup_exp_dir(self) -> Path:
         """Create `Experiments/<model>/<dataset>/<train_mode>` directory."""
@@ -77,7 +81,7 @@ class OptimizedExperimentRunner:
         )
 
     def _build_backbone_model(self) -> nn.Module:
-        """Build plain backbone model from `Models/eeg_models.py` registry."""
+        """Build plain backbone model from `Models/model_registry.py` registry."""
         name = self.config["model"]
         registry = model_dict()
         if name not in registry:
@@ -107,13 +111,20 @@ class OptimizedExperimentRunner:
         """
         cfg = self.config
 
-        optimizer = torch.optim.Adam(
+        lr = float(cfg["learning_rate"])
+        eta_min_factor = float(cfg.get("cosine_eta_min_factor", 0.01))
+        eta_min = float(cfg.get("cosine_eta_min", lr * eta_min_factor))
+        t_max = int(cfg.get("cosine_t_max", cfg.get("epochs", 400)))
+
+        optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=float(cfg["learning_rate"]),
+            lr=lr,
             weight_decay=float(cfg.get("weight_decay", 0.0)),
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=int(cfg.get("lr_patience", 5))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, t_max),
+            eta_min=eta_min,
         )
 
         stage_tag = cfg.get("train_mode", "train")
@@ -133,8 +144,10 @@ class OptimizedExperimentRunner:
     def run_experiment(self):
         """Run LOSO over all subjects in the selected dataset."""
         set_random_seed(int(self.config.get("random_seed", 2024)))
+        self.log.info(f"HyR-DPA switches | {self.hyr_dpa.describe()}")
 
         self.runtime_records = []
+        self.source_selection_records = []
 
         dataset_dir = self._dataset_dir()
 
@@ -147,9 +160,9 @@ class OptimizedExperimentRunner:
             sid = int(m.group(1))
             subject_file_map[f"sub{sid}"] = str(dataset_dir / filename)
 
-        _ = self._get_init_state()
+        self._get_init_state()
 
-        metric_history = {k: [] for k in ["AUC", "BA", "F1", "TPR", "TNR"]}
+        metric_history = {k: [] for k in ["AUC", "BA", "F1", "TPR", "FPR"]}
 
         with MemoryManager.cuda_memory_context():
             for filename in subject_files:
@@ -159,12 +172,17 @@ class OptimizedExperimentRunner:
                 if not m:
                     continue
                 subject_id = int(m.group(1))
+                source_scores, manual_sources, forced_mode = self._fold_source_selection_inputs(
+                    test_subject_id=subject_id,
+                    subject_file_map=subject_file_map,
+                )
 
                 self.datamodule.prepare_data(
                     test_subject_id=subject_id,
                     subject_file_map=subject_file_map,
-                    mode="normal",
-                    train_range=self.config.get("train_range", "train"),
+                    source_scores=source_scores,
+                    manual_source_subjects=manual_sources,
+                    forced_source_selection_mode=forced_mode,
                 )
 
                 metrics = self._run_subject(subject_id)
@@ -173,6 +191,7 @@ class OptimizedExperimentRunner:
                     metric_history[k].append(metrics[k])
 
         self._save_results(metric_history)
+        self._save_source_selection()
 
         if self.runtime_records:
             import pandas as _pd
@@ -201,6 +220,23 @@ class OptimizedExperimentRunner:
             pretty = {k: f"{mean_row[k]:.3f}+/-{std_row[k]:.3f}" for k in cols if k in mean_row and k in std_row}
             self.log.info(f"[RUNTIME-DATASET] {pretty}")
 
+    def _fold_source_selection_inputs(
+        self,
+        test_subject_id: int,
+        subject_file_map: Dict[str, str],
+    ) -> Tuple[Optional[Dict[str, float]], Optional[List[str]], Optional[str]]:
+        """
+        Hook for fold-specific source selection inputs.
+        Return:
+        - source_scores: {'sub2': score, ...}
+        - manual_source_subjects: ['sub2', 'sub5', ...]
+        - forced_mode: all | random_k | scores | manual
+        """
+        return self.hyr_dpa.build_source_selection_inputs(
+            test_subject_id=test_subject_id,
+            subject_file_map=subject_file_map,
+        )
+
     def _dataset_dir(self) -> Path:
         """Resolve dataset directory path for current dataset and sampling rate."""
         cfg = self.config
@@ -224,12 +260,13 @@ class OptimizedExperimentRunner:
         del model
         elapsed = _t.perf_counter() - t0
         self.log.info(f"Subject {subject_id} completed in {elapsed:.2f}s")
-        return {k: round(v, 4) for k, v in zip(["AUC", "BA", "F1", "TPR", "TNR"], metric_values)}
+        return {k: round(v, 4) for k, v in zip(["AUC", "BA", "F1", "TPR", "FPR"], metric_values)}
 
     def _run_single_subject(self, model: nn.Module, subject_id: int) -> Tuple[float, float, float, float, float]:
         """Single-stage train/eval for one LOSO target subject."""
         # Build split datasets first so class weights are fold-specific.
-        self.datamodule.setup(stage=2, is_split_domains=True)
+        self.datamodule.setup()
+        self._record_source_selection(subject_id)
 
         class_weights = None
         if bool(self.config.get("class_weighted_ce", True)):
@@ -259,7 +296,16 @@ class OptimizedExperimentRunner:
         trainer.setup_logging(log_dir, ckpt_dir, stage=2, run_name=f"metrics_sub{subject_id}")
 
         if self.config.get("is_training", True):
-            self._train(trainer)
+            mode = str(self.config.get("training_mode", "End2End")).strip().lower()
+            if mode == "decoupled":
+                self.log.info("Training mode: Decoupled | Stage 1 (feature alignment scaffold)")
+                self.hyr_dpa.stage1_feature_alignment()
+                self._train(trainer)
+                self.log.info("Training mode: Decoupled | Stage 2 (classifier rectification scaffold)")
+                self.hyr_dpa.stage2_classifier_rectification()
+            else:
+                self.log.info("Training mode: End2End")
+                self._train(trainer)
 
         return self._eval(trainer, ckpt_dir)
 
@@ -286,7 +332,7 @@ class OptimizedExperimentRunner:
 
     def _eval(self, trainer, ckpt_dir: Path) -> Tuple[float, float, float, float, float]:
         """Load best checkpoint and run evaluation."""
-        best_path = ckpt_dir / "best_model--2.pth"
+        best_path = ckpt_dir / "best_ba_model--2.pth"
         trainer.model.load_state_dict(load_from_checkpoint(Path.cwd() / best_path))
 
         test_loader = self.datamodule.test_dataloader(batch_size=int(self.config.get("test_batch_size", 1000)))
@@ -327,7 +373,7 @@ class OptimizedExperimentRunner:
             except Exception as _e:
                 self.log.warning(f"Runtime metrics save failed: {_e}")
         del self.datamodule.test_dataset
-        return metrics[1:]  # AUC, BA, F1, TPR, TNR
+        return metrics[1:]  # AUC, BA, F1, TPR, FPR
 
     def _prepare_dirs(self, subject_id: int) -> Tuple[Path, Path]:
         """Create per-subject checkpoint and log directories."""
@@ -348,7 +394,7 @@ class OptimizedExperimentRunner:
     def _log_subject(self, subject_id: int, metrics: Dict[str, float]):
         self.log.info(
             f"Subject {subject_id} | AUC: {metrics['AUC']:.4f} | BA: {metrics['BA']:.4f} "
-            f"| F1: {metrics['F1']:.4f} | TPR: {metrics['TPR']:.4f} | TNR: {metrics['TNR']:.4f}"
+            f"| F1: {metrics['F1']:.4f} | TPR: {metrics['TPR']:.4f} | FPR: {metrics['FPR']:.4f}"
         )
 
     def _save_results(self, results: Dict[str, List[float]]):
@@ -356,7 +402,7 @@ class OptimizedExperimentRunner:
         df = pd.DataFrame(results)
         df.insert(0, "SUB", [f"SUB{i+1}" for i in range(len(df))])
 
-        metrics = ["AUC", "BA", "F1", "TPR", "TNR"]
+        metrics = ["AUC", "BA", "F1", "TPR", "FPR"]
         avg = df[metrics].mean().round(4)
         std = df[metrics].std().round(4)
 
@@ -372,6 +418,36 @@ class OptimizedExperimentRunner:
         formatted = {k: f"{avg[k]:.4f}+/-{std[k]:.4f}" for k in metrics}
         self.log.info(f"Average metrics: {formatted}")
         self.log.info(f"Results saved to {csv_path}")
+
+    def _record_source_selection(self, subject_id: int):
+        info = dict(getattr(self.datamodule, "source_selection_info", {}) or {})
+        if not info:
+            return
+        selected = info.get("selected_subjects", [])
+        self.log.info(
+            f"Subject {subject_id} source selection | mode={info.get('mode')} | "
+            f"selected={info.get('num_selected')}/{info.get('num_candidates')} | "
+            f"subjects={selected}"
+        )
+        self.source_selection_records.append(
+            {
+                "subject": subject_id,
+                "mode": info.get("mode"),
+                "k": info.get("k"),
+                "min_score": info.get("min_score"),
+                "num_candidates": info.get("num_candidates"),
+                "num_selected": info.get("num_selected"),
+                "selected_subjects": ",".join(selected),
+            }
+        )
+
+    def _save_source_selection(self):
+        if not self.source_selection_records:
+            return
+        df = pd.DataFrame(self.source_selection_records)
+        out = self.exp_dir / "source_selection.csv"
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        self.log.info(f"Source selection records saved to {out}")
 
 
 class OptimizedTrainer:
@@ -425,6 +501,12 @@ class OptimizedTrainer:
         self.save_other_model.path = checkpoint_dir / f"best_ba_model-{stage_suffix}.pth"
 
     def fit(self, train_loader, val_loader, stage: int, epochs: int):
+        patience = int(self.config.get("patience", 20))
+        early_stop_start_epoch = int(self.config.get("early_stop_start_epoch", 0))
+        ba_delta = float(self.config.get("ba_delta", 0.0))
+        best_ba = float("-inf")
+        no_improve_epochs = 0
+
         for epoch in range(1, epochs + 1):
             self.current_epoch = epoch
             with MemoryManager.cuda_memory_context():
@@ -442,13 +524,27 @@ class OptimizedTrainer:
                 if self.tb_logger is not None and train_ba is not None and val_ba is not None:
                     ba_gap = float(train_ba) - float(val_ba)
                     self.tb_logger.experiment.add_scalar(f"val/stage{stage}/BA_gap_train_minus_val", ba_gap, self.current_epoch)
-                self.earlystopping(val_loss_avg, self.model)
-                self.save_other_model(val_ba, self.model)
-                if self.earlystopping.early_stop:
-                    self._log_info("Early stopping triggered.")
+
+                if val_ba is not None:
+                    val_ba_f = float(val_ba)
+                    self.save_other_model(val_ba_f, self.model)
+
+                    if val_ba_f > (best_ba + ba_delta):
+                        best_ba = val_ba_f
+                        no_improve_epochs = 0
+                    elif epoch > early_stop_start_epoch:
+                        no_improve_epochs += 1
+                elif epoch > early_stop_start_epoch:
+                    no_improve_epochs += 1
+
+                if epoch > early_stop_start_epoch and no_improve_epochs >= patience:
+                    self._log_info(
+                        f"Early stopping triggered on BA | epoch={epoch} | "
+                        f"start_epoch={early_stop_start_epoch} | patience={patience} | best_BA={best_ba:.4f}"
+                    )
                     break
 
-                self.scheduler.step(val_loss_avg)
+                self.scheduler.step()
 
                 if hasattr(self.model, "step_epoch"):
                     self.model.step_epoch(1)
@@ -460,7 +556,7 @@ class OptimizedTrainer:
         Run one training/eval epoch and return:
           [
             (loss_avgs_list, loss_names_list),
-            AUC, BA, F1, TPR, TNR
+            AUC, BA, F1, TPR, FPR
           ]
         """
         self.model.train() if training else self.model.eval()
@@ -535,19 +631,19 @@ class OptimizedTrainer:
         targets = torch.cat(all_targets) if len(all_targets) else torch.empty(0, dtype=torch.long)
 
         if len(all_probs):
-            ba, _, tpr, tnr, auc = calculate_metrics(targets, predictions, y_prob=probabilities)
+            ba, _, tpr, fpr, auc = calculate_metrics(targets, predictions, y_prob=probabilities)
             f1 = cal_F1_score(targets, predictions)
             AUC = auc.numpy().round(4) if auc is not None else None
             BA = ba.numpy().round(4)
             F1 = f1.numpy().round(4)
             TPR = tpr.numpy().round(4)
-            TNR = tnr.numpy().round(4)
+            FPR = fpr.numpy().round(4)
         else:
-            AUC = BA = F1 = TPR = TNR = None
+            AUC = BA = F1 = TPR = FPR = None
 
         denom = max(n_batches, 1)
         loss_avgs = [s / denom for s in loss_sums] if loss_sums else [0.0]
-        metrics = [(loss_avgs, loss_names), AUC, BA, F1, TPR, TNR]
+        metrics = [(loss_avgs, loss_names), AUC, BA, F1, TPR, FPR]
 
         if len(all_probs):
             MemoryManager.cleanup_tensors(probabilities, predictions, targets)
@@ -642,10 +738,8 @@ class OptimizedTrainer:
             if value is not None:
                 self.tb_logger.experiment.add_scalar(f"{prefix}/Loss/{name}", value, self.current_epoch)
 
-        auc, ba, f1, tpr, tnr = metrics[1:]
-        for name, value in zip(["AUC", "BA", "F1", "TPR", "TNR"], [auc, ba, f1, tpr, tnr]):
+        auc, ba, f1, tpr, fpr = metrics[1:]
+        for name, value in zip(["AUC", "BA", "F1", "TPR", "FPR"], [auc, ba, f1, tpr, fpr]):
             if value is not None:
                 self.tb_logger.experiment.add_scalar(f"{prefix}/{name}", value, self.current_epoch)
-
-
 

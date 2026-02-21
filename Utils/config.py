@@ -21,6 +21,11 @@ def _to_bool(value):
             return False
     return bool(value)
 
+
+def _is_none_like(value):
+    return value in (None, "", "None", "none", "null", "NULL")
+
+
 def load_config(config_path):
     """从 yaml 文件中加载配置"""
     with open(config_path, 'r', encoding="utf-8") as file:
@@ -108,15 +113,36 @@ def build_config(model_name, dataset_name=None):
         merged_config["seed"] = merged_config.get("random_seed", 2024)
 
     # （可选）确保关键类型是正确的
-    int_fields = ["sub_num", "n_channels", "fs", "n_class", "batch_size", "epochs"]
+    int_fields = [
+        "sub_num",
+        "n_channels",
+        "fs",
+        "n_class",
+        "batch_size",
+        "epochs",
+        "patience",
+        "early_stop_start_epoch",
+        "cosine_t_max",
+    ]
     for f in int_fields:
-        if f in merged_config:
+        if f in merged_config and not _is_none_like(merged_config[f]):
             merged_config[f] = int(merged_config[f])
 
-    float_fields = ["learning_rate", "weight_decay"]
+    float_fields = ["learning_rate", "weight_decay", "cosine_eta_min_factor", "cosine_eta_min"]
     for f in float_fields:
-        if f in merged_config:
+        if f in merged_config and not _is_none_like(merged_config[f]):
             merged_config[f] = float(merged_config[f])
+
+    optional_int_fields = ["source_selection_k"]
+    optional_int_fields.extend(["pccs_positive_label", "pccs_background_label", "pccs_max_trials_per_class"])
+    for f in optional_int_fields:
+        if f in merged_config:
+            merged_config[f] = None if _is_none_like(merged_config[f]) else int(merged_config[f])
+
+    optional_float_fields = ["source_selection_min_score"]
+    for f in optional_float_fields:
+        if f in merged_config:
+            merged_config[f] = None if _is_none_like(merged_config[f]) else float(merged_config[f])
 
     bool_fields = [
         "is_training",
@@ -125,6 +151,8 @@ def build_config(model_name, dataset_name=None):
         "log_runtime",
         "class_weighted_ce",
         "use_target_stream",
+        "logit_adjustment",
+        "pseudo_refinement",
     ]
     for f in bool_fields:
         if f in merged_config:

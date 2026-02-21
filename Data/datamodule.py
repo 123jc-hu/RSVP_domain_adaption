@@ -1,13 +1,17 @@
-import os
-import re
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
+from Data.source_selection import (
+    normalize_score_map,
+    normalize_subject_key,
+    normalize_subject_list,
+    select_source_subjects,
+)
 
 class NPZMemmapSubsetDataset(Dataset):
     """
@@ -150,28 +154,29 @@ class EEGDataModuleCrossSubject:
         self.test_dataset = None
         self.target_unlabeled_dataset = None
         self.source_subject_keys: List[str] = []
+        self.source_candidate_keys: List[str] = []
         self.source_train_class_counts: Optional[np.ndarray] = None
+        self.source_selection_info: Dict[str, Any] = {}
+
+        self._label_cache: Dict[str, np.ndarray] = {}
+        self._external_source_scores: Dict[str, float] = {}
+        self._external_manual_sources: List[str] = []
+        self._forced_source_selection_mode: Optional[str] = None
 
     def prepare_data(
         self,
         test_subject_id: int,
         subject_file_map: Dict[str, str],
-        indices_path: Optional[str] = None,
-        mode: str = "normal",
-        train_range: str = "train",
+        source_scores: Optional[Dict[Union[str, int], float]] = None,
+        manual_source_subjects: Optional[List[Union[str, int]]] = None,
+        forced_source_selection_mode: Optional[str] = None,
     ):
-        _ = indices_path
-        _ = mode
-        _ = train_range
-
         if not isinstance(subject_file_map, dict):
             raise TypeError("subject_file_map must be dict: {'sub1': '/path/sub1.npz', ...}")
 
         normalized = {}
         for key, path in subject_file_map.items():
-            skey = f"sub{key}" if isinstance(key, int) else str(key)
-            if not re.match(r"^sub\d+$", skey):
-                raise ValueError(f"Invalid subject key: {skey}")
+            skey = normalize_subject_key(key)
             normalized[skey] = str(path)
 
         self.subject_file_map = normalized
@@ -182,17 +187,26 @@ class EEGDataModuleCrossSubject:
             raise KeyError(f"Missing held-out subject: {held_out}")
         self.test_path = self.subject_file_map[held_out]
 
-    def setup(self, stage: int = 1, is_split_domains: bool = False):
-        _ = stage
-        _ = is_split_domains
+        self._external_source_scores = normalize_score_map(source_scores)
+        self._external_manual_sources = normalize_subject_list(manual_source_subjects)
+        self._forced_source_selection_mode = (
+            str(forced_source_selection_mode).strip().lower()
+            if forced_source_selection_mode is not None
+            else None
+        )
+
+    def setup(self):
         assert self.subject_file_map is not None, "Call prepare_data() first."
         assert self.test_subject_id is not None, "test_subject_id is not set."
 
         held_out = f"sub{self.test_subject_id}"
-        self.source_subject_keys = sorted(
+        self.source_candidate_keys = sorted(
             [k for k in self.subject_file_map.keys() if k != held_out],
             key=lambda x: int(x[3:]),
         )
+        self.source_subject_keys = self._select_source_subjects(held_out, self.source_candidate_keys)
+        if not self.source_subject_keys:
+            raise RuntimeError("Selected source subject list is empty.")
 
         source_train_parts: List[Dataset] = []
         source_val_parts: List[Dataset] = []
@@ -281,6 +295,51 @@ class EEGDataModuleCrossSubject:
             drop_last=False,
         )
 
+    def _select_source_subjects(self, held_out_key: str, candidate_keys: List[str]) -> List[str]:
+        mode = self._forced_source_selection_mode
+        if not mode:
+            mode = str(self.config.get("source_selection_mode", "")).strip().lower()
+        if not mode:
+            strategy = str(self.config.get("source_selection", "All")).strip().lower()
+            strategy_map = {"all": "all", "random": "random_k", "pccs": "scores"}
+            mode = strategy_map.get(strategy, "all")
+
+        k_val = self.config.get("source_selection_k", None)
+        min_score_val = self.config.get("source_selection_min_score", None)
+        k = None if k_val in (None, "", "None", "none", "null", "NULL") else int(k_val)
+        min_score = None if min_score_val in (None, "", "None", "none", "null", "NULL") else float(min_score_val)
+
+        manual_sources = self._external_manual_sources
+        if not manual_sources:
+            manual_sources = normalize_subject_list(self.config.get("source_selection_subjects", []))
+
+        source_scores = self._external_source_scores
+        if not source_scores:
+            cfg_scores = self.config.get("source_selection_scores", {})
+            source_scores = normalize_score_map(cfg_scores if isinstance(cfg_scores, dict) else {})
+
+        selected = select_source_subjects(
+            candidate_subjects=candidate_keys,
+            held_out_subject=held_out_key,
+            mode=mode,
+            seed=self.seed,
+            k=k,
+            manual_subjects=manual_sources,
+            score_map=source_scores,
+            min_score=min_score,
+        )
+
+        self.source_selection_info = {
+            "held_out": held_out_key,
+            "mode": mode,
+            "k": k,
+            "min_score": min_score,
+            "num_candidates": len(candidate_keys),
+            "num_selected": len(selected),
+            "selected_subjects": list(selected),
+        }
+        return selected
+
     def _subject_len(self, sub_key: str) -> int:
         y = self._load_subject_labels(self.subject_file_map[sub_key])
         return int(y.shape[0])
@@ -359,9 +418,11 @@ class EEGDataModuleCrossSubject:
             t = t.to(device)
         return t
 
-    @staticmethod
-    def _load_subject_labels(subject_file: str) -> np.ndarray:
-        cache_dir = NPZMemmapSubsetDataset._ensure_npz_cache(
-            Path(subject_file), ["y_data.npy"]
-        )
-        return np.load(cache_dir / "y_data.npy", mmap_mode="r")
+    def _load_subject_labels(self, subject_file: str) -> np.ndarray:
+        subject_file = str(subject_file)
+        if subject_file not in self._label_cache:
+            cache_dir = NPZMemmapSubsetDataset._ensure_npz_cache(
+                Path(subject_file), ["y_data.npy"]
+            )
+            self._label_cache[subject_file] = np.load(cache_dir / "y_data.npy", mmap_mode="r")
+        return self._label_cache[subject_file]

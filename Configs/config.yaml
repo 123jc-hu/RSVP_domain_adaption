@@ -3,15 +3,36 @@ is_training: true
 random_seed: 2024
 dataset: THU
 n_fold: null
-epochs: 200
+epochs: 400
 weight_decay: 0.0001
-patience: 10
+patience: 20
+early_stop_start_epoch: 50
 use_gpu: true
 train_mode: cross-subject
 data_mix: true
 class_weighted_ce: true
 use_target_stream: false
 dataset_root: E:/learning_projects/few-shot-learning_RSVP/Dataset
+cosine_eta_min_factor: 0.01
+
+# HyR-DPA framework switches (scaffold stage)
+source_selection: All      # Options: PCCS | All | Random
+embedding_space: Euclidean # Options: Hyperbolic | Euclidean
+psi_method: None           # Options: Tangent_Space | Time_Domain | None
+training_mode: End2End     # Options: Decoupled | End2End
+logit_adjustment: false
+pseudo_refinement: false
+
+# Source selection controls
+source_selection_k: null
+source_selection_min_score: null
+source_selection_subjects: []
+source_selection_scores: {}
+
+# PCCS scaffold controls
+pccs_positive_label: 1
+pccs_background_label: 0
+pccs_max_trials_per_class: 128
 
 log_runtime: true
 rt_deadline_ms: 200.0
@@ -63,15 +84,20 @@ datasets:
 models:
   DeepConvNet:
     learning_rate: 0.00005
+    cosine_t_max: 400
 
   EEGNet:
     learning_rate: 0.001
+    cosine_t_max: 400
 
   PLNet:
     learning_rate: 0.001
+    cosine_t_max: 400
 
   EEGInception:
     learning_rate: 0.0001
+    cosine_t_max: 400
 
   PPNN:
     learning_rate: 0.0001
+    cosine_t_max: 400
