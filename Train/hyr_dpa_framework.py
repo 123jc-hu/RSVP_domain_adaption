@@ -35,6 +35,7 @@ class HyRDPAScaffold:
         self.config = config
         self.log = logger
         self.settings = HyRDPASettings.from_config(config)
+        self.last_source_selection_meta: Dict = {}
 
     def describe(self) -> str:
         s = self.settings
@@ -56,25 +57,55 @@ class HyRDPAScaffold:
         """
         held_out = f"sub{int(test_subject_id)}"
         source_pool = {k: v for k, v in subject_file_map.items() if k != held_out}
+        self.last_source_selection_meta = {
+            "held_out": held_out,
+            "strategy": str(self.settings.source_selection),
+            "mode": None,
+            "ranking": [],
+        }
 
         mode = str(self.settings.source_selection).strip().lower()
         if mode == "all":
+            self.last_source_selection_meta["mode"] = "all"
             return None, None, "all"
         if mode == "random":
+            self.last_source_selection_meta["mode"] = "random_k"
             return None, None, "random_k"
         if mode == "pccs":
-            scores = compute_pccs_source_scores(
+            scores, details = compute_pccs_source_scores(
                 target_subject_file=subject_file_map[held_out],
                 source_subject_files=source_pool,
                 positive_label=int(self.config.get("pccs_positive_label", 1)),
                 background_label=int(self.config.get("pccs_background_label", 0)),
                 max_trials_per_class=int(self.config.get("pccs_max_trials_per_class", 128)),
-                seed=int(self.config.get("random_seed", 2024)) + int(test_subject_id),
+                min_trials_per_class=int(self.config.get("pccs_min_trials_per_class", 4)),
+                seed=int(self.config.get("random_seed", 2026)),
+                cov_eps=float(self.config.get("pccs_cov_eps", 1e-6)),
+                cov_shrinkage=float(self.config.get("pccs_cov_shrinkage", 0.0)),
+                mean_metric=str(self.config.get("pccs_mean_metric", "airm")),
+                distance_metric=str(self.config.get("pccs_distance_metric", "airm")),
+                mean_max_iter=int(self.config.get("pccs_mean_max_iter", 20)),
+                mean_tol=float(self.config.get("pccs_mean_tol", 1e-6)),
+                return_details=True,
+                return_prototypes=True,
             )
             if not scores:
                 # Safe fallback for folds where scaffold score can't be computed.
+                self.last_source_selection_meta["mode"] = "all"
                 return None, None, "all"
+            rank = details.get("ranking", [])
+            preview = ", ".join([f"{r['subject']}:{r['score']:.4f}" for r in rank[:5]])
+            if self.log is not None:
+                self.log.info(f"PCCS ranking for sub{test_subject_id} (top-5): {preview}")
+            self.last_source_selection_meta = {
+                "held_out": held_out,
+                "strategy": "PCCS",
+                "mode": "scores",
+                "details": details,
+                "ranking": rank,
+            }
             return scores, None, "scores"
+        self.last_source_selection_meta["mode"] = None
         return None, None, None
 
     def stage1_feature_alignment(self) -> None:
@@ -93,4 +124,3 @@ class HyRDPAScaffold:
         - optional pseudo-label consistency refinement
         """
         return
-

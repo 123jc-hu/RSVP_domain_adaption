@@ -33,7 +33,7 @@ def load_config(config_path):
     # return Namespace(**config)
     return config
 
-def set_random_seed(seed=2024):
+def set_random_seed(seed=2026):
     """设置随机种子以确保实验可复现"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -110,7 +110,7 @@ def build_config(model_name, dataset_name=None):
 
     # --- seed 命名统一（你的 runner 用的是 'seed'，而 YAML 用的是 'random_seed'）
     if "seed" not in merged_config:
-        merged_config["seed"] = merged_config.get("random_seed", 2024)
+        merged_config["seed"] = merged_config.get("random_seed", 2026)
 
     # （可选）确保关键类型是正确的
     int_fields = [
@@ -128,13 +128,30 @@ def build_config(model_name, dataset_name=None):
         if f in merged_config and not _is_none_like(merged_config[f]):
             merged_config[f] = int(merged_config[f])
 
-    float_fields = ["learning_rate", "weight_decay", "cosine_eta_min_factor", "cosine_eta_min"]
+    float_fields = [
+        "learning_rate",
+        "weight_decay",
+        "cosine_eta_min_factor",
+        "cosine_eta_min",
+        "pccs_mean_tol",
+        "pccs_cov_eps",
+        "pccs_cov_shrinkage",
+    ]
     for f in float_fields:
         if f in merged_config and not _is_none_like(merged_config[f]):
             merged_config[f] = float(merged_config[f])
 
-    optional_int_fields = ["source_selection_k"]
-    optional_int_fields.extend(["pccs_positive_label", "pccs_background_label", "pccs_max_trials_per_class"])
+    optional_int_fields = ["source_selection_k", "pccs_top_k"]
+    optional_int_fields.extend(
+        [
+            "pccs_positive_label",
+            "pccs_background_label",
+            "pccs_max_trials_per_class",
+            "pccs_min_trials_per_class",
+            "pccs_mean_max_iter",
+            "pccs_plot_top_k",
+        ]
+    )
     for f in optional_int_fields:
         if f in merged_config:
             merged_config[f] = None if _is_none_like(merged_config[f]) else int(merged_config[f])

@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
+import numpy as np
 import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
 
@@ -63,6 +64,8 @@ class OptimizedExperimentRunner:
         self._init_state_cache: Dict[tuple, Dict[str, torch.Tensor]] = {}
         self.runtime_records: List[Dict[str, Any]] = []
         self.source_selection_records: List[Dict[str, Any]] = []
+        self.pccs_ranking_records: List[Dict[str, Any]] = []
+        self.pccs_fold_records: List[Dict[str, Any]] = []
 
     def _setup_exp_dir(self) -> Path:
         """Create `Experiments/<model>/<dataset>/<train_mode>` directory."""
@@ -143,11 +146,13 @@ class OptimizedExperimentRunner:
 
     def run_experiment(self):
         """Run LOSO over all subjects in the selected dataset."""
-        set_random_seed(int(self.config.get("random_seed", 2024)))
+        set_random_seed(int(self.config.get("random_seed", 2026)))
         self.log.info(f"HyR-DPA switches | {self.hyr_dpa.describe()}")
 
         self.runtime_records = []
         self.source_selection_records = []
+        self.pccs_ranking_records = []
+        self.pccs_fold_records = []
 
         dataset_dir = self._dataset_dir()
 
@@ -166,7 +171,7 @@ class OptimizedExperimentRunner:
 
         with MemoryManager.cuda_memory_context():
             for filename in subject_files:
-                set_random_seed(int(self.config.get("random_seed", 2024)))
+                set_random_seed(int(self.config.get("random_seed", 2026)))
 
                 m = re.search(r"sub(\d+)", filename)
                 if not m:
@@ -192,6 +197,7 @@ class OptimizedExperimentRunner:
 
         self._save_results(metric_history)
         self._save_source_selection()
+        self._save_pccs_artifacts()
 
         if self.runtime_records:
             import pandas as _pd
@@ -440,6 +446,7 @@ class OptimizedExperimentRunner:
                 "selected_subjects": ",".join(selected),
             }
         )
+        self._record_pccs_details(subject_id, selected_subjects=selected)
 
     def _save_source_selection(self):
         if not self.source_selection_records:
@@ -448,6 +455,238 @@ class OptimizedExperimentRunner:
         out = self.exp_dir / "source_selection.csv"
         df.to_csv(out, index=False, encoding="utf-8-sig")
         self.log.info(f"Source selection records saved to {out}")
+
+    def _record_pccs_details(self, subject_id: int, selected_subjects: List[str]):
+        meta = dict(getattr(self.hyr_dpa, "last_source_selection_meta", {}) or {})
+        if str(meta.get("mode", "")).lower() != "scores":
+            return
+        details = dict(meta.get("details", {}) or {})
+        ranking = list(details.get("ranking", []) or [])
+        if not ranking:
+            return
+
+        selected_set = set(selected_subjects or [])
+        target_info = dict(details.get("target", {}) or {})
+        held_out = str(meta.get("held_out", f"sub{subject_id}"))
+        prototypes = dict(details.get("prototypes", {}) or {})
+        self._save_pccs_fold_prototypes(
+            subject_id=subject_id,
+            held_out=held_out,
+            ranking=ranking,
+            selected_subjects=selected_subjects,
+            prototypes=prototypes,
+        )
+        self._save_pccs_fold_topk_plot(
+            subject_id=subject_id,
+            held_out=held_out,
+            ranking=ranking,
+            selected_subjects=selected_subjects,
+        )
+
+        for rank_idx, row in enumerate(ranking, start=1):
+            rec = {
+                "target_subject": held_out,
+                "target_id": int(subject_id),
+                "source_subject": row.get("subject"),
+                "rank": int(rank_idx),
+                "score": float(row.get("score", float("nan"))),
+                "distance": float(row.get("distance", float("nan"))),
+                "positive_total_trials": int(row.get("positive_total_trials", 0)),
+                "positive_used_trials": int(row.get("positive_used_trials", 0)),
+                "source_proto_trace": float(row.get("source_proto_trace", float("nan"))),
+                "source_proto_logdet": float(row.get("source_proto_logdet", float("nan"))),
+                "source_proto_cond": float(row.get("source_proto_cond", float("nan"))),
+                "is_selected": int(row.get("subject") in selected_set),
+                "target_bg_total_trials": int(target_info.get("background_total_trials", 0)),
+                "target_bg_used_trials": int(target_info.get("background_used_trials", 0)),
+                "target_bg_proto_trace": float(target_info.get("target_bg_proto_trace", float("nan"))),
+                "target_bg_proto_logdet": float(target_info.get("target_bg_proto_logdet", float("nan"))),
+                "target_bg_proto_cond": float(target_info.get("target_bg_proto_cond", float("nan"))),
+            }
+            self.pccs_ranking_records.append(rec)
+
+        best_row = ranking[0]
+        selected_rows = [r for r in ranking if r.get("subject") in selected_set]
+        self.pccs_fold_records.append(
+            {
+                "target_subject": held_out,
+                "target_id": int(subject_id),
+                "num_candidates": int(len(ranking)),
+                "num_selected": int(len(selected_set)),
+                "best_source_subject": best_row.get("subject"),
+                "best_score": float(best_row.get("score", float("nan"))),
+                "best_distance": float(best_row.get("distance", float("nan"))),
+                "selected_score_mean": float(np.mean([r.get("score", float("nan")) for r in selected_rows]))
+                if selected_rows
+                else float("nan"),
+                "selected_distance_mean": float(np.mean([r.get("distance", float("nan")) for r in selected_rows]))
+                if selected_rows
+                else float("nan"),
+                "target_bg_total_trials": int(target_info.get("background_total_trials", 0)),
+                "target_bg_used_trials": int(target_info.get("background_used_trials", 0)),
+            }
+        )
+
+    def _save_pccs_fold_prototypes(
+        self,
+        *,
+        subject_id: int,
+        held_out: str,
+        ranking: List[Dict[str, Any]],
+        selected_subjects: List[str],
+        prototypes: Dict[str, Any],
+    ):
+        if not prototypes:
+            return
+        target_bg = prototypes.get("target_bg", None)
+        source_pos_map = dict(prototypes.get("source_pos", {}) or {})
+        if target_bg is None or not source_pos_map:
+            return
+
+        rank_subjects = [str(r.get("subject")) for r in ranking if r.get("subject") in source_pos_map]
+        if not rank_subjects:
+            return
+        all_stack = np.stack([np.asarray(source_pos_map[s], dtype=np.float64) for s in rank_subjects], axis=0)
+        selected_subjects = [s for s in (selected_subjects or []) if s in source_pos_map]
+        selected_stack = (
+            np.stack([np.asarray(source_pos_map[s], dtype=np.float64) for s in selected_subjects], axis=0)
+            if selected_subjects
+            else np.empty((0, *all_stack.shape[1:]), dtype=np.float64)
+        )
+
+        out_dir = self.exp_dir / "pccs_prototypes"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_npz = out_dir / f"{held_out}.npz"
+        np.savez_compressed(
+            out_npz,
+            target_subject=np.array([held_out]),
+            target_bg=np.asarray(target_bg, dtype=np.float64),
+            source_subjects=np.array(rank_subjects),
+            source_pos=all_stack,
+            selected_subjects=np.array(selected_subjects),
+            selected_source_pos=selected_stack,
+        )
+
+    def _save_pccs_fold_topk_plot(
+        self,
+        *,
+        subject_id: int,
+        held_out: str,
+        ranking: List[Dict[str, Any]],
+        selected_subjects: List[str],
+    ):
+        if not ranking:
+            return
+        topk = int(self.config.get("pccs_plot_top_k", 10))
+        topk = max(1, min(topk, len(ranking)))
+        rows = ranking[:topk]
+        labels = [str(r.get("subject")) for r in rows]
+        values = [float(r.get("score", float("nan"))) for r in rows]
+        selected_set = set(selected_subjects or [])
+        colors = ["tab:orange" if lb in selected_set else "tab:blue" for lb in labels]
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig = plt.figure(figsize=(9, 4))
+            plt.bar(range(len(labels)), values, color=colors)
+            plt.xticks(range(len(labels)), labels, rotation=45, ha="right")
+            plt.ylabel("PCCS score (-distance)")
+            plt.title(f"PCCS Top-{topk} for {held_out}")
+            plt.tight_layout()
+            out_dir = self.exp_dir / "pccs_plots"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out_dir / f"pccs_topk_{held_out}.png", dpi=150)
+            plt.close(fig)
+        except Exception as _e:
+            self.log.warning(f"PCCS top-k plot save failed for {held_out}: {_e}")
+
+    def _save_pccs_artifacts(self):
+        if not self.pccs_ranking_records:
+            return
+
+        df = pd.DataFrame(self.pccs_ranking_records)
+        out_long = self.exp_dir / "pccs_ranking_long.csv"
+        df.to_csv(out_long, index=False, encoding="utf-8-sig")
+
+        df_selected = df[df["is_selected"] == 1].copy()
+        out_selected = self.exp_dir / "pccs_selected_topk.csv"
+        df_selected.to_csv(out_selected, index=False, encoding="utf-8-sig")
+
+        if self.pccs_fold_records:
+            df_fold = pd.DataFrame(self.pccs_fold_records)
+            out_fold = self.exp_dir / "pccs_fold_summary.csv"
+            df_fold.to_csv(out_fold, index=False, encoding="utf-8-sig")
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig = plt.figure(figsize=(7, 4))
+            plt.hist(df["distance"].dropna().values, bins=30)
+            plt.title("PCCS Distance Distribution")
+            plt.xlabel("Riemannian Distance")
+            plt.ylabel("Count")
+            plt.tight_layout()
+            fig.savefig(self.exp_dir / "pccs_distance_hist.png", dpi=150)
+            plt.close(fig)
+
+            if not df_selected.empty:
+                fig = plt.figure(figsize=(7, 4))
+                plt.hist(df_selected["distance"].dropna().values, bins=20)
+                plt.title("PCCS Selected Source Distance Distribution")
+                plt.xlabel("Riemannian Distance")
+                plt.ylabel("Count")
+                plt.tight_layout()
+                fig.savefig(self.exp_dir / "pccs_selected_distance_hist.png", dpi=150)
+                plt.close(fig)
+
+            # Fold x source score heatmap
+            score_mat = df.pivot_table(
+                index="target_subject",
+                columns="source_subject",
+                values="score",
+                aggfunc="mean",
+            )
+            if not score_mat.empty:
+                fig = plt.figure(figsize=(10, 6))
+                arr = score_mat.values
+                im = plt.imshow(arr, aspect="auto")
+                plt.colorbar(im, fraction=0.03, pad=0.02, label="PCCS score")
+                plt.yticks(range(score_mat.shape[0]), score_mat.index.tolist())
+                plt.xticks(range(score_mat.shape[1]), score_mat.columns.tolist(), rotation=90)
+                plt.xlabel("Source subject")
+                plt.ylabel("Target subject")
+                plt.title("PCCS Score Heatmap")
+                plt.tight_layout()
+                fig.savefig(self.exp_dir / "pccs_score_heatmap.png", dpi=150)
+                plt.close(fig)
+
+            # Fold x source selected mask heatmap
+            selected_mat = df.pivot_table(
+                index="target_subject",
+                columns="source_subject",
+                values="is_selected",
+                aggfunc="max",
+                fill_value=0,
+            )
+            if not selected_mat.empty:
+                fig = plt.figure(figsize=(10, 6))
+                arr = selected_mat.values
+                im = plt.imshow(arr, aspect="auto", vmin=0.0, vmax=1.0)
+                plt.colorbar(im, fraction=0.03, pad=0.02, label="Selected (1/0)")
+                plt.yticks(range(selected_mat.shape[0]), selected_mat.index.tolist())
+                plt.xticks(range(selected_mat.shape[1]), selected_mat.columns.tolist(), rotation=90)
+                plt.xlabel("Source subject")
+                plt.ylabel("Target subject")
+                plt.title("PCCS Selection Heatmap")
+                plt.tight_layout()
+                fig.savefig(self.exp_dir / "pccs_selection_heatmap.png", dpi=150)
+                plt.close(fig)
+        except Exception as _e:
+            self.log.warning(f"PCCS visualization save failed: {_e}")
+
+        self.log.info(f"PCCS ranking records saved to {out_long}")
+        self.log.info(f"PCCS selected-source records saved to {out_selected}")
 
 
 class OptimizedTrainer:
@@ -742,4 +981,3 @@ class OptimizedTrainer:
         for name, value in zip(["AUC", "BA", "F1", "TPR", "FPR"], [auc, ba, f1, tpr, fpr]):
             if value is not None:
                 self.tb_logger.experiment.add_scalar(f"{prefix}/{name}", value, self.current_epoch)
-

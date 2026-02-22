@@ -43,7 +43,7 @@ def select_source_subjects(
     held_out_subject: SubjectLike,
     *,
     mode: str = "all",
-    seed: int = 2024,
+    seed: int = 2026,
     k: Optional[int] = None,
     manual_subjects: Optional[Sequence[SubjectLike]] = None,
     score_map: Optional[Dict[SubjectLike, float]] = None,

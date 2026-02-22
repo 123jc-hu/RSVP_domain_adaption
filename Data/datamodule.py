@@ -141,7 +141,7 @@ class EEGDataModuleCrossSubject:
 
     def __init__(self, config: Dict):
         self.config = config
-        self.seed = int(config.get("random_seed", 2024))
+        self.seed = int(config.get("random_seed", 2026))
         self.source_val_ratio = float(config.get("source_val_ratio", 0.2))
 
         self.subject_file_map: Optional[Dict[str, str]] = None
@@ -305,6 +305,8 @@ class EEGDataModuleCrossSubject:
             mode = strategy_map.get(strategy, "all")
 
         k_val = self.config.get("source_selection_k", None)
+        if k_val in (None, "", "None", "none", "null", "NULL"):
+            k_val = self.config.get("pccs_top_k", None)
         min_score_val = self.config.get("source_selection_min_score", None)
         k = None if k_val in (None, "", "None", "none", "null", "NULL") else int(k_val)
         min_score = None if min_score_val in (None, "", "None", "none", "null", "NULL") else float(min_score_val)

@@ -1,6 +1,6 @@
 model: EEGNet
 is_training: true
-random_seed: 2024
+random_seed: 2026
 dataset: THU
 n_fold: null
 epochs: 400
@@ -33,6 +33,15 @@ source_selection_scores: {}
 pccs_positive_label: 1
 pccs_background_label: 0
 pccs_max_trials_per_class: 128
+pccs_min_trials_per_class: 4
+pccs_top_k: null
+pccs_mean_metric: airm
+pccs_distance_metric: airm
+pccs_mean_max_iter: 20
+pccs_mean_tol: 1.0e-6
+pccs_cov_eps: 1.0e-6
+pccs_cov_shrinkage: 0.0
+pccs_plot_top_k: 10
 
 log_runtime: true
 rt_deadline_ms: 200.0
