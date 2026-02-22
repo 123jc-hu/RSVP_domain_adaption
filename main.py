@@ -14,7 +14,8 @@ def main(config):
     experiment.run_experiment()
 
     logger.info("Finished training and testing!")
-    logger.info(f"Elapsed time: {(time.time() - start_time) / 60:.2f} minutes \n")
+    elapsed_minutes = (time.time() - start_time) / 60.0
+    logger.info(f"Elapsed time: {elapsed_minutes:.2f} minutes \n")
 
 
 if __name__ == "__main__":

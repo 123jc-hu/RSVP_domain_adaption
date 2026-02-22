@@ -89,13 +89,14 @@ class HyRDPAScaffold:
                 score_mode = "discrim_only"
             else:
                 score_mode = str(cfg("rpcs_score_mode", "pccs_score_mode", "rpcs"))
-            mean_metric = str(cfg("rpcs_mean_metric", "pccs_mean_metric", "airm")).strip().lower()
-            dist_metric = str(cfg("rpcs_distance_metric", "pccs_distance_metric", "airm")).strip().lower()
-            if self.log is not None and mean_metric != dist_metric:
+            mean_metric = str(cfg("rpcs_mean_metric", "pccs_mean_metric", "riemann")).strip().lower()
+            dist_metric = str(cfg("rpcs_distance_metric", "pccs_distance_metric", mean_metric)).strip().lower()
+            if mean_metric != dist_metric and self.log is not None:
                 self.log.warning(
-                    f"R-PCS metric mismatch: mean_metric={mean_metric}, distance_metric={dist_metric}. "
-                    "Using consistent metrics is recommended."
+                    f"R-PCS metric mismatch requested ({mean_metric} vs {dist_metric}); "
+                    f"forcing both to {mean_metric} for consistency."
                 )
+            dist_metric = mean_metric
             scores, details = compute_rpcs_source_scores(
                 target_subject_file=subject_file_map[held_out],
                 source_subject_files=source_pool,
@@ -106,16 +107,26 @@ class HyRDPAScaffold:
                 seed=int(self.config.get("random_seed", 2026)),
                 cov_eps=float(cfg("rpcs_cov_eps", "pccs_cov_eps", 1e-6)),
                 cov_shrinkage=float(cfg("rpcs_cov_shrinkage", "pccs_cov_shrinkage", 0.0)),
+                cov_estimator=str(cfg("rpcs_cov_estimator", "pccs_cov_estimator", "sample")),
+                use_correlation=bool(cfg("rpcs_use_correlation", "pccs_use_correlation", True)),
+                correlation_eps=float(cfg("rpcs_correlation_eps", "pccs_correlation_eps", 1e-12)),
+                input_layout=str(cfg("rpcs_input_layout", "pccs_input_layout", "channel_first")),
                 mean_metric=mean_metric,
                 distance_metric=dist_metric,
                 mean_max_iter=int(cfg("rpcs_mean_max_iter", "pccs_mean_max_iter", 20)),
                 mean_tol=float(cfg("rpcs_mean_tol", "pccs_mean_tol", 1e-6)),
                 score_mode=str(score_mode),
-                score_eps=float(cfg("rpcs_score_eps", "pccs_score_eps", 1e-8)),
+                score_eps=float(cfg("rpcs_score_eps", "pccs_score_eps", 1e-6)),
                 target_use_all_trials=bool(
                     cfg("rpcs_target_use_all_trials", "pccs_target_use_all_trials", True)
                 ),
                 target_max_trials=cfg("rpcs_target_max_trials", "pccs_target_max_trials", None),
+                target_bg_mode=str(cfg("rpcs_target_bg_mode", "pccs_target_bg_mode", "amplitude")),
+                target_bg_ratio=float(cfg("rpcs_target_bg_ratio", "pccs_target_bg_ratio", 0.7)),
+                tau_d=cfg("rpcs_tau_d", "pccs_tau_d", None),
+                tau_s=cfg("rpcs_tau_s", "pccs_tau_s", None),
+                tau_d_percentile=float(cfg("rpcs_tau_d_percentile", "pccs_tau_d_percentile", 30.0)),
+                tau_s_percentile=float(cfg("rpcs_tau_s_percentile", "pccs_tau_s_percentile", 70.0)),
                 return_details=True,
                 return_prototypes=True,
             )

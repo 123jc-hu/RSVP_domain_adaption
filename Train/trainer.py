@@ -64,8 +64,8 @@ class OptimizedExperimentRunner:
         self._init_state_cache: Dict[tuple, Dict[str, torch.Tensor]] = {}
         self.runtime_records: List[Dict[str, Any]] = []
         self.source_selection_records: List[Dict[str, Any]] = []
-        self.pccs_ranking_records: List[Dict[str, Any]] = []
-        self.pccs_fold_records: List[Dict[str, Any]] = []
+        self.rpcs_ranking_records: List[Dict[str, Any]] = []
+        self.rpcs_fold_records: List[Dict[str, Any]] = []
 
     def _setup_exp_dir(self) -> Path:
         """Create `Experiments/<model>/<dataset>/<train_mode>` directory."""
@@ -151,8 +151,8 @@ class OptimizedExperimentRunner:
 
         self.runtime_records = []
         self.source_selection_records = []
-        self.pccs_ranking_records = []
-        self.pccs_fold_records = []
+        self.rpcs_ranking_records = []
+        self.rpcs_fold_records = []
 
         dataset_dir = self._dataset_dir()
 
@@ -197,7 +197,7 @@ class OptimizedExperimentRunner:
 
         self._save_results(metric_history)
         self._save_source_selection()
-        self._save_pccs_artifacts()
+        self._save_rpcs_artifacts()
 
         if self.runtime_records:
             import pandas as _pd
@@ -446,7 +446,7 @@ class OptimizedExperimentRunner:
                 "selected_subjects": ",".join(selected),
             }
         )
-        self._record_pccs_details(subject_id, selected_subjects=selected)
+        self._record_rpcs_details(subject_id, selected_subjects=selected)
 
     def _save_source_selection(self):
         if not self.source_selection_records:
@@ -456,7 +456,7 @@ class OptimizedExperimentRunner:
         df.to_csv(out, index=False, encoding="utf-8-sig")
         self.log.info(f"Source selection records saved to {out}")
 
-    def _record_pccs_details(self, subject_id: int, selected_subjects: List[str]):
+    def _record_rpcs_details(self, subject_id: int, selected_subjects: List[str]):
         meta = dict(getattr(self.hyr_dpa, "last_source_selection_meta", {}) or {})
         if str(meta.get("mode", "")).lower() != "scores":
             return
@@ -469,14 +469,14 @@ class OptimizedExperimentRunner:
         target_info = dict(details.get("target", {}) or {})
         held_out = str(meta.get("held_out", f"sub{subject_id}"))
         prototypes = dict(details.get("prototypes", {}) or {})
-        self._save_pccs_fold_prototypes(
+        self._save_rpcs_fold_prototypes(
             subject_id=subject_id,
             held_out=held_out,
             ranking=ranking,
             selected_subjects=selected_subjects,
             prototypes=prototypes,
         )
-        self._save_pccs_fold_topk_plot(
+        self._save_rpcs_fold_topk_plot(
             subject_id=subject_id,
             held_out=held_out,
             ranking=ranking,
@@ -527,11 +527,11 @@ class OptimizedExperimentRunner:
                 "target_bg_proto_logdet": float(target_info.get("target_bg_proto_logdet", float("nan"))),
                 "target_bg_proto_cond": float(target_info.get("target_bg_proto_cond", float("nan"))),
             }
-            self.pccs_ranking_records.append(rec)
+            self.rpcs_ranking_records.append(rec)
 
         best_row = ranking[0]
         selected_rows = [r for r in ranking if r.get("subject") in selected_set]
-        self.pccs_fold_records.append(
+        self.rpcs_fold_records.append(
             {
                 "target_subject": held_out,
                 "target_id": int(subject_id),
@@ -566,7 +566,7 @@ class OptimizedExperimentRunner:
             }
         )
 
-    def _save_pccs_fold_prototypes(
+    def _save_rpcs_fold_prototypes(
         self,
         *,
         subject_id: int,
@@ -604,7 +604,7 @@ class OptimizedExperimentRunner:
             else np.empty((0, *all_bg_stack.shape[1:]), dtype=np.float64)
         )
 
-        out_dir = self.exp_dir / "pccs_prototypes"
+        out_dir = self.exp_dir / "rpcs_prototypes"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_npz = out_dir / f"{held_out}.npz"
         np.savez_compressed(
@@ -619,7 +619,7 @@ class OptimizedExperimentRunner:
             selected_source_bg=selected_bg_stack,
         )
 
-    def _save_pccs_fold_topk_plot(
+    def _save_rpcs_fold_topk_plot(
         self,
         *,
         subject_id: int,
@@ -653,28 +653,28 @@ class OptimizedExperimentRunner:
             plt.ylabel(f"R-PCS score ({score_mode})")
             plt.title(f"R-PCS Top-{topk} for {held_out}")
             plt.tight_layout()
-            out_dir = self.exp_dir / "pccs_plots"
+            out_dir = self.exp_dir / "rpcs_plots"
             out_dir.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out_dir / f"pccs_topk_{held_out}.png", dpi=150)
+            fig.savefig(out_dir / f"rpcs_topk_{held_out}.png", dpi=150)
             plt.close(fig)
         except Exception as _e:
             self.log.warning(f"R-PCS top-k plot save failed for {held_out}: {_e}")
 
-    def _save_pccs_artifacts(self):
-        if not self.pccs_ranking_records:
+    def _save_rpcs_artifacts(self):
+        if not self.rpcs_ranking_records:
             return
 
-        df = pd.DataFrame(self.pccs_ranking_records)
-        out_long = self.exp_dir / "pccs_ranking_long.csv"
+        df = pd.DataFrame(self.rpcs_ranking_records)
+        out_long = self.exp_dir / "rpcs_ranking_long.csv"
         df.to_csv(out_long, index=False, encoding="utf-8-sig")
 
         df_selected = df[df["is_selected"] == 1].copy()
-        out_selected = self.exp_dir / "pccs_selected_topk.csv"
+        out_selected = self.exp_dir / "rpcs_selected_topk.csv"
         df_selected.to_csv(out_selected, index=False, encoding="utf-8-sig")
 
-        if self.pccs_fold_records:
-            df_fold = pd.DataFrame(self.pccs_fold_records)
-            out_fold = self.exp_dir / "pccs_fold_summary.csv"
+        if self.rpcs_fold_records:
+            df_fold = pd.DataFrame(self.rpcs_fold_records)
+            out_fold = self.exp_dir / "rpcs_fold_summary.csv"
             df_fold.to_csv(out_fold, index=False, encoding="utf-8-sig")
 
         try:
@@ -686,7 +686,7 @@ class OptimizedExperimentRunner:
             plt.xlabel("Distance(P_source_p300, P_target_bg)")
             plt.ylabel("Count")
             plt.tight_layout()
-            fig.savefig(self.exp_dir / "pccs_distance_hist.png", dpi=150)
+            fig.savefig(self.exp_dir / "rpcs_distance_hist.png", dpi=150)
             plt.close(fig)
 
             if not df_selected.empty:
@@ -699,7 +699,7 @@ class OptimizedExperimentRunner:
                 plt.xlabel("Distance(P_source_p300, P_target_bg)")
                 plt.ylabel("Count")
                 plt.tight_layout()
-                fig.savefig(self.exp_dir / "pccs_selected_distance_hist.png", dpi=150)
+                fig.savefig(self.exp_dir / "rpcs_selected_distance_hist.png", dpi=150)
                 plt.close(fig)
 
                 if "similarity_distance" in df_selected.columns:
@@ -709,7 +709,7 @@ class OptimizedExperimentRunner:
                     plt.xlabel("Distance(P_source_bg, P_target_bg)")
                     plt.ylabel("Count")
                     plt.tight_layout()
-                    fig.savefig(self.exp_dir / "pccs_selected_similarity_hist.png", dpi=150)
+                    fig.savefig(self.exp_dir / "rpcs_selected_similarity_hist.png", dpi=150)
                     plt.close(fig)
 
             # Fold x source score heatmap
@@ -730,7 +730,7 @@ class OptimizedExperimentRunner:
                 plt.ylabel("Target subject")
                 plt.title("R-PCS Score Heatmap")
                 plt.tight_layout()
-                fig.savefig(self.exp_dir / "pccs_score_heatmap.png", dpi=150)
+                fig.savefig(self.exp_dir / "rpcs_score_heatmap.png", dpi=150)
                 plt.close(fig)
 
             # Fold x source selected mask heatmap
@@ -752,7 +752,7 @@ class OptimizedExperimentRunner:
                 plt.ylabel("Target subject")
                 plt.title("R-PCS Selection Heatmap")
                 plt.tight_layout()
-                fig.savefig(self.exp_dir / "pccs_selection_heatmap.png", dpi=150)
+                fig.savefig(self.exp_dir / "rpcs_selection_heatmap.png", dpi=150)
                 plt.close(fig)
         except Exception as _e:
             self.log.warning(f"R-PCS visualization save failed: {_e}")

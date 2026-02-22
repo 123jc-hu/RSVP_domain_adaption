@@ -35,17 +35,27 @@ rpcs_background_label: 0
 rpcs_max_trials_per_class: 128
 rpcs_min_trials_per_class: 4
 rpcs_top_k: null
-rpcs_mean_metric: airm
-rpcs_distance_metric: airm
+rpcs_mean_metric: riemann
+rpcs_distance_metric: riemann
 rpcs_mean_max_iter: 20
 rpcs_mean_tol: 1.0e-6
 rpcs_cov_eps: 1.0e-6
 rpcs_cov_shrinkage: 0.0
+rpcs_cov_estimator: sample      # sample | oas | lw
+rpcs_use_correlation: true
+rpcs_correlation_eps: 1.0e-12
+rpcs_input_layout: channel_first # channel_first | time_first | auto
 rpcs_plot_top_k: 10
 rpcs_score_mode: rpcs
-rpcs_score_eps: 1.0e-8
+rpcs_score_eps: 1.0e-6
 rpcs_target_use_all_trials: true
 rpcs_target_max_trials: null
+rpcs_target_bg_mode: amplitude  # amplitude | kurtosis | all
+rpcs_target_bg_ratio: 0.7
+rpcs_tau_d: null
+rpcs_tau_s: null
+rpcs_tau_d_percentile: 30.0
+rpcs_tau_s_percentile: 70.0
 
 # PCCS scaffold controls (legacy compatibility)
 pccs_positive_label: 1
@@ -53,17 +63,27 @@ pccs_background_label: 0
 pccs_max_trials_per_class: 128
 pccs_min_trials_per_class: 4
 pccs_top_k: null
-pccs_mean_metric: airm
-pccs_distance_metric: airm
+pccs_mean_metric: riemann
+pccs_distance_metric: riemann
 pccs_mean_max_iter: 20
 pccs_mean_tol: 1.0e-6
 pccs_cov_eps: 1.0e-6
 pccs_cov_shrinkage: 0.0
+pccs_cov_estimator: sample
+pccs_use_correlation: true
+pccs_correlation_eps: 1.0e-12
+pccs_input_layout: channel_first
 pccs_plot_top_k: 10
 pccs_score_mode: rpcs          # rpcs | similarity_only | discrim_only (used when source_selection=R-PCS/PCCS)
-pccs_score_eps: 1.0e-8
+pccs_score_eps: 1.0e-6
 pccs_target_use_all_trials: true
 pccs_target_max_trials: null
+pccs_target_bg_mode: amplitude
+pccs_target_bg_ratio: 0.7
+pccs_tau_d: null
+pccs_tau_s: null
+pccs_tau_d_percentile: 30.0
+pccs_tau_s_percentile: 70.0
 
 log_runtime: true
 rt_deadline_ms: 200.0
