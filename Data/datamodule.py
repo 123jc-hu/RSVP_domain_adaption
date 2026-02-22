@@ -7,10 +7,10 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from Data.source_selection import (
+    SelectionManager,
     normalize_score_map,
     normalize_subject_key,
     normalize_subject_list,
-    select_source_subjects,
 )
 
 class NPZMemmapSubsetDataset(Dataset):
@@ -162,6 +162,7 @@ class EEGDataModuleCrossSubject:
         self._external_source_scores: Dict[str, float] = {}
         self._external_manual_sources: List[str] = []
         self._forced_source_selection_mode: Optional[str] = None
+        self.selection_manager = SelectionManager(seed=self.seed)
 
     def prepare_data(
         self,
@@ -300,11 +301,26 @@ class EEGDataModuleCrossSubject:
         if not mode:
             mode = str(self.config.get("source_selection_mode", "")).strip().lower()
         if not mode:
-            strategy = str(self.config.get("source_selection", "All")).strip().lower()
-            strategy_map = {"all": "all", "random": "random_k", "pccs": "scores"}
+            strategy = (
+                str(self.config.get("source_selection", "All"))
+                .strip()
+                .lower()
+                .replace("-", "")
+                .replace("_", "")
+            )
+            strategy_map = {
+                "all": "all",
+                "random": "random_k",
+                "pccs": "scores",
+                "rpcs": "scores",
+                "similarityonly": "scores",
+                "discrimonly": "scores",
+            }
             mode = strategy_map.get(strategy, "all")
 
         k_val = self.config.get("source_selection_k", None)
+        if k_val in (None, "", "None", "none", "null", "NULL"):
+            k_val = self.config.get("rpcs_top_k", None)
         if k_val in (None, "", "None", "none", "null", "NULL"):
             k_val = self.config.get("pccs_top_k", None)
         min_score_val = self.config.get("source_selection_min_score", None)
@@ -320,11 +336,10 @@ class EEGDataModuleCrossSubject:
             cfg_scores = self.config.get("source_selection_scores", {})
             source_scores = normalize_score_map(cfg_scores if isinstance(cfg_scores, dict) else {})
 
-        selected = select_source_subjects(
+        selected = self.selection_manager.select(
             candidate_subjects=candidate_keys,
             held_out_subject=held_out_key,
-            mode=mode,
-            seed=self.seed,
+            policy=mode,
             k=k,
             manual_subjects=manual_sources,
             score_map=source_scores,

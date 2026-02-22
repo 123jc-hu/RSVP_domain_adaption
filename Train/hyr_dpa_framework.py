@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from Data.pccs import compute_pccs_source_scores
+from Data.rpcs import compute_rpcs_source_scores
 
 
 @dataclass
 class HyRDPASettings:
-    source_selection: str = "All"      # PCCS | All | Random
+    source_selection: str = "All"      # All | Random | R-PCS | SimilarityOnly | DiscrimOnly
     embedding_space: str = "Euclidean" # Hyperbolic | Euclidean
     psi_method: str = "None"           # Tangent_Space | Time_Domain | None
     training_mode: str = "End2End"     # Decoupled | End2End
@@ -64,28 +64,58 @@ class HyRDPAScaffold:
             "ranking": [],
         }
 
-        mode = str(self.settings.source_selection).strip().lower()
+        mode = (
+            str(self.settings.source_selection)
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+        )
         if mode == "all":
             self.last_source_selection_meta["mode"] = "all"
             return None, None, "all"
         if mode == "random":
             self.last_source_selection_meta["mode"] = "random_k"
             return None, None, "random_k"
-        if mode == "pccs":
-            scores, details = compute_pccs_source_scores(
+        if mode in ("pccs", "rpcs", "similarityonly", "discrimonly"):
+            def cfg(pref_key: str, legacy_key: str, default):
+                if pref_key in self.config and self.config.get(pref_key) is not None:
+                    return self.config.get(pref_key)
+                return self.config.get(legacy_key, default)
+
+            if mode == "similarityonly":
+                score_mode = "similarity_only"
+            elif mode == "discrimonly":
+                score_mode = "discrim_only"
+            else:
+                score_mode = str(cfg("rpcs_score_mode", "pccs_score_mode", "rpcs"))
+            mean_metric = str(cfg("rpcs_mean_metric", "pccs_mean_metric", "airm")).strip().lower()
+            dist_metric = str(cfg("rpcs_distance_metric", "pccs_distance_metric", "airm")).strip().lower()
+            if self.log is not None and mean_metric != dist_metric:
+                self.log.warning(
+                    f"R-PCS metric mismatch: mean_metric={mean_metric}, distance_metric={dist_metric}. "
+                    "Using consistent metrics is recommended."
+                )
+            scores, details = compute_rpcs_source_scores(
                 target_subject_file=subject_file_map[held_out],
                 source_subject_files=source_pool,
-                positive_label=int(self.config.get("pccs_positive_label", 1)),
-                background_label=int(self.config.get("pccs_background_label", 0)),
-                max_trials_per_class=int(self.config.get("pccs_max_trials_per_class", 128)),
-                min_trials_per_class=int(self.config.get("pccs_min_trials_per_class", 4)),
+                positive_label=int(cfg("rpcs_positive_label", "pccs_positive_label", 1)),
+                background_label=int(cfg("rpcs_background_label", "pccs_background_label", 0)),
+                max_trials_per_class=int(cfg("rpcs_max_trials_per_class", "pccs_max_trials_per_class", 128)),
+                min_trials_per_class=int(cfg("rpcs_min_trials_per_class", "pccs_min_trials_per_class", 4)),
                 seed=int(self.config.get("random_seed", 2026)),
-                cov_eps=float(self.config.get("pccs_cov_eps", 1e-6)),
-                cov_shrinkage=float(self.config.get("pccs_cov_shrinkage", 0.0)),
-                mean_metric=str(self.config.get("pccs_mean_metric", "airm")),
-                distance_metric=str(self.config.get("pccs_distance_metric", "airm")),
-                mean_max_iter=int(self.config.get("pccs_mean_max_iter", 20)),
-                mean_tol=float(self.config.get("pccs_mean_tol", 1e-6)),
+                cov_eps=float(cfg("rpcs_cov_eps", "pccs_cov_eps", 1e-6)),
+                cov_shrinkage=float(cfg("rpcs_cov_shrinkage", "pccs_cov_shrinkage", 0.0)),
+                mean_metric=mean_metric,
+                distance_metric=dist_metric,
+                mean_max_iter=int(cfg("rpcs_mean_max_iter", "pccs_mean_max_iter", 20)),
+                mean_tol=float(cfg("rpcs_mean_tol", "pccs_mean_tol", 1e-6)),
+                score_mode=str(score_mode),
+                score_eps=float(cfg("rpcs_score_eps", "pccs_score_eps", 1e-8)),
+                target_use_all_trials=bool(
+                    cfg("rpcs_target_use_all_trials", "pccs_target_use_all_trials", True)
+                ),
+                target_max_trials=cfg("rpcs_target_max_trials", "pccs_target_max_trials", None),
                 return_details=True,
                 return_prototypes=True,
             )
@@ -94,12 +124,17 @@ class HyRDPAScaffold:
                 self.last_source_selection_meta["mode"] = "all"
                 return None, None, "all"
             rank = details.get("ranking", [])
-            preview = ", ".join([f"{r['subject']}:{r['score']:.4f}" for r in rank[:5]])
+            preview = ", ".join(
+                [
+                    f"{r['subject']}:score={r['score']:.4f},D={r.get('discriminability_distance', float('nan')):.4f},S={r.get('similarity_distance', float('nan')):.4f}"
+                    for r in rank[:5]
+                ]
+            )
             if self.log is not None:
-                self.log.info(f"PCCS ranking for sub{test_subject_id} (top-5): {preview}")
+                self.log.info(f"R-PCS ranking for sub{test_subject_id} (top-5): {preview}")
             self.last_source_selection_meta = {
                 "held_out": held_out,
-                "strategy": "PCCS",
+                "strategy": str(self.settings.source_selection),
                 "mode": "scores",
                 "details": details,
                 "ranking": rank,

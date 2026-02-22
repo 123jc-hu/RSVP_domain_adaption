@@ -16,7 +16,7 @@ dataset_root: E:/learning_projects/few-shot-learning_RSVP/Dataset
 cosine_eta_min_factor: 0.01
 
 # HyR-DPA framework switches (scaffold stage)
-source_selection: All      # Options: PCCS | All | Random
+source_selection: All      # Options: All | Random | R-PCS | SimilarityOnly | DiscrimOnly (PCCS alias)
 embedding_space: Euclidean # Options: Hyperbolic | Euclidean
 psi_method: None           # Options: Tangent_Space | Time_Domain | None
 training_mode: End2End     # Options: Decoupled | End2End
@@ -29,7 +29,25 @@ source_selection_min_score: null
 source_selection_subjects: []
 source_selection_scores: {}
 
-# PCCS scaffold controls
+# R-PCS controls (preferred) + PCCS legacy aliases
+rpcs_positive_label: 1
+rpcs_background_label: 0
+rpcs_max_trials_per_class: 128
+rpcs_min_trials_per_class: 4
+rpcs_top_k: null
+rpcs_mean_metric: airm
+rpcs_distance_metric: airm
+rpcs_mean_max_iter: 20
+rpcs_mean_tol: 1.0e-6
+rpcs_cov_eps: 1.0e-6
+rpcs_cov_shrinkage: 0.0
+rpcs_plot_top_k: 10
+rpcs_score_mode: rpcs
+rpcs_score_eps: 1.0e-8
+rpcs_target_use_all_trials: true
+rpcs_target_max_trials: null
+
+# PCCS scaffold controls (legacy compatibility)
 pccs_positive_label: 1
 pccs_background_label: 0
 pccs_max_trials_per_class: 128
@@ -42,6 +60,10 @@ pccs_mean_tol: 1.0e-6
 pccs_cov_eps: 1.0e-6
 pccs_cov_shrinkage: 0.0
 pccs_plot_top_k: 10
+pccs_score_mode: rpcs          # rpcs | similarity_only | discrim_only (used when source_selection=R-PCS/PCCS)
+pccs_score_eps: 1.0e-8
+pccs_target_use_all_trials: true
+pccs_target_max_trials: null
 
 log_runtime: true
 rt_deadline_ms: 200.0

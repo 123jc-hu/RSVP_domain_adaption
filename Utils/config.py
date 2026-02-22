@@ -133,17 +133,34 @@ def build_config(model_name, dataset_name=None):
         "weight_decay",
         "cosine_eta_min_factor",
         "cosine_eta_min",
+        "rpcs_mean_tol",
+        "rpcs_cov_eps",
+        "rpcs_cov_shrinkage",
+        "rpcs_score_eps",
         "pccs_mean_tol",
         "pccs_cov_eps",
         "pccs_cov_shrinkage",
+        "pccs_score_eps",
     ]
     for f in float_fields:
         if f in merged_config and not _is_none_like(merged_config[f]):
             merged_config[f] = float(merged_config[f])
 
-    optional_int_fields = ["source_selection_k", "pccs_top_k"]
+    optional_int_fields = [
+        "source_selection_k",
+        "rpcs_top_k",
+        "rpcs_target_max_trials",
+        "pccs_top_k",
+        "pccs_target_max_trials",
+    ]
     optional_int_fields.extend(
         [
+            "rpcs_positive_label",
+            "rpcs_background_label",
+            "rpcs_max_trials_per_class",
+            "rpcs_min_trials_per_class",
+            "rpcs_mean_max_iter",
+            "rpcs_plot_top_k",
             "pccs_positive_label",
             "pccs_background_label",
             "pccs_max_trials_per_class",
@@ -170,6 +187,8 @@ def build_config(model_name, dataset_name=None):
         "use_target_stream",
         "logit_adjustment",
         "pseudo_refinement",
+        "rpcs_target_use_all_trials",
+        "pccs_target_use_all_trials",
     ]
     for f in bool_fields:
         if f in merged_config:
