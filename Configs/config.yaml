@@ -52,6 +52,7 @@ rpcs_target_use_all_trials: true
 rpcs_target_max_trials: null
 rpcs_target_bg_mode: amplitude  # amplitude | kurtosis | all
 rpcs_target_bg_ratio: 0.7
+rpcs_target_bg_channel_indices: []  # used by amplitude_restricted mode
 rpcs_tau_d: null
 rpcs_tau_s: null
 rpcs_tau_d_percentile: 30.0
@@ -80,6 +81,7 @@ pccs_target_use_all_trials: true
 pccs_target_max_trials: null
 pccs_target_bg_mode: amplitude
 pccs_target_bg_ratio: 0.7
+pccs_target_bg_channel_indices: []
 pccs_tau_d: null
 pccs_tau_s: null
 pccs_tau_d_percentile: 30.0

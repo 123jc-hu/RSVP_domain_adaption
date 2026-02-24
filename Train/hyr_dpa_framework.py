@@ -123,6 +123,11 @@ class HyRDPAScaffold:
                 target_max_trials=cfg("rpcs_target_max_trials", "pccs_target_max_trials", None),
                 target_bg_mode=str(cfg("rpcs_target_bg_mode", "pccs_target_bg_mode", "amplitude")),
                 target_bg_ratio=float(cfg("rpcs_target_bg_ratio", "pccs_target_bg_ratio", 0.7)),
+                target_bg_channel_indices=cfg(
+                    "rpcs_target_bg_channel_indices",
+                    "pccs_target_bg_channel_indices",
+                    None,
+                ),
                 tau_d=cfg("rpcs_tau_d", "pccs_tau_d", None),
                 tau_s=cfg("rpcs_tau_s", "pccs_tau_s", None),
                 tau_d_percentile=float(cfg("rpcs_tau_d_percentile", "pccs_tau_d_percentile", 30.0)),

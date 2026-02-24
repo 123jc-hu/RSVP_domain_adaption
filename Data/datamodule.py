@@ -1,4 +1,3 @@
-import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -6,6 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
+from Data.npz_io import ensure_npz_cache
 from Data.source_selection import (
     SelectionManager,
     normalize_score_map,
@@ -29,7 +29,7 @@ class NPZMemmapSubsetDataset(Dataset):
         indices: Optional[Union[np.ndarray, slice]] = None,
     ):
         self.file_path = Path(file_path)
-        cache_dir = self._ensure_npz_cache(self.file_path, [f"{x_key}.npy", f"{y_key}.npy"])
+        cache_dir = ensure_npz_cache(self.file_path, [f"{x_key}.npy", f"{y_key}.npy"])
         self.x_data = np.load(cache_dir / f"{x_key}.npy", mmap_mode="r")
         self.y_data = np.load(cache_dir / f"{y_key}.npy", mmap_mode="r")
 
@@ -53,25 +53,8 @@ class NPZMemmapSubsetDataset(Dataset):
 
     @staticmethod
     def _ensure_npz_cache(npz_path: Path, members: List[str]) -> Path:
-        cache_dir = npz_path.with_suffix("")
-        cache_dir = cache_dir.parent / (cache_dir.name + ".__cache__")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        with zipfile.ZipFile(npz_path, "r") as zf:
-            names = set(zf.namelist())
-            for member in members:
-                out_path = cache_dir / member
-                if out_path.exists():
-                    continue
-                if member not in names:
-                    raise KeyError(f"{npz_path} missing member {member}")
-                with zf.open(member, "r") as src, open(out_path, "wb") as dst:
-                    while True:
-                        chunk = src.read(16 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-        return cache_dir
+        # Backward-compatible wrapper.
+        return ensure_npz_cache(npz_path, members)
 
 
 class UnlabeledViewDataset(Dataset):
@@ -438,8 +421,6 @@ class EEGDataModuleCrossSubject:
     def _load_subject_labels(self, subject_file: str) -> np.ndarray:
         subject_file = str(subject_file)
         if subject_file not in self._label_cache:
-            cache_dir = NPZMemmapSubsetDataset._ensure_npz_cache(
-                Path(subject_file), ["y_data.npy"]
-            )
+            cache_dir = ensure_npz_cache(Path(subject_file), ["y_data.npy"])
             self._label_cache[subject_file] = np.load(cache_dir / "y_data.npy", mmap_mode="r")
         return self._label_cache[subject_file]

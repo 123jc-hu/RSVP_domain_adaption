@@ -4,16 +4,11 @@ import zlib
 
 import numpy as np
 
-from Data.datamodule import NPZMemmapSubsetDataset
+from Data.npz_io import load_npz_xy_memmap
 
 
 def _load_xy_memmap(subject_file: str):
-    cache_dir = NPZMemmapSubsetDataset._ensure_npz_cache(
-        Path(subject_file), ["x_data.npy", "y_data.npy"]
-    )
-    x = np.load(cache_dir / "x_data.npy", mmap_mode="r")
-    y = np.load(cache_dir / "y_data.npy", mmap_mode="r")
-    return x, y
+    return load_npz_xy_memmap(Path(subject_file), x_key="x_data", y_key="y_data")
 
 
 def _stable_int_from_string(text: str) -> int:
@@ -263,10 +258,42 @@ def _subsample_indices(
     return rng.choice(indices, size=m, replace=False).astype(np.int64)
 
 
+def _normalize_max_trials(max_trials: Optional[int]) -> Optional[int]:
+    if max_trials is None:
+        return None
+    m = int(max_trials)
+    return m if m > 0 else None
+
+
 def _target_amplitude_scores(trials: np.ndarray) -> np.ndarray:
     # peak-to-peak proxy across channels and time.
     tmax = np.max(trials, axis=(1, 2))
     tmin = np.min(trials, axis=(1, 2))
+    return (tmax - tmin).astype(np.float64)
+
+
+def _target_amplitude_scores_restricted(
+    trials: np.ndarray,
+    channel_indices: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    """
+    Peak-to-peak amplitude computed only on specified channel indices.
+    If channel_indices is None/empty, falls back to global amplitude score.
+    """
+    if channel_indices is None:
+        return _target_amplitude_scores(trials)
+    ch_idx = np.asarray(list(channel_indices), dtype=int).reshape(-1)
+    if ch_idx.size == 0:
+        return _target_amplitude_scores(trials)
+
+    n_channels = int(trials.shape[1])
+    ch_idx = ch_idx[(ch_idx >= 0) & (ch_idx < n_channels)]
+    if ch_idx.size == 0:
+        return _target_amplitude_scores(trials)
+
+    restricted = np.asarray(trials)[:, ch_idx, :]
+    tmax = np.max(restricted, axis=(1, 2))
+    tmin = np.min(restricted, axis=(1, 2))
     return (tmax - tmin).astype(np.float64)
 
 
@@ -290,12 +317,18 @@ def select_target_bg_subset(
     trials: np.ndarray,
     mode: str = "amplitude",
     ratio: float = 0.7,
+    channel_indices: Optional[Sequence[int]] = None,
 ) -> np.ndarray:
     """
     Select target background-like subset.
     Returns subset trials array (same dims except first axis).
     """
-    idx = select_target_bg_subset_indices(trials=trials, mode=mode, ratio=ratio)
+    idx = select_target_bg_subset_indices(
+        trials=trials,
+        mode=mode,
+        ratio=ratio,
+        channel_indices=channel_indices,
+    )
     return np.asarray(trials)[idx]
 
 
@@ -305,6 +338,7 @@ def select_target_bg_subset_indices(
     mode: str = "amplitude",
     ratio: float = 0.7,
     min_keep: int = 8,
+    channel_indices: Optional[Sequence[int]] = None,
 ) -> np.ndarray:
     n = int(trials.shape[0])
     if n <= 0:
@@ -322,6 +356,11 @@ def select_target_bg_subset_indices(
         scores = _target_amplitude_scores(trials)
     elif mode_norm in ("kurtosis", "kurt"):
         scores = _target_kurtosis_scores(trials)
+    elif mode_norm in ("amplitude_restricted", "amp_restricted", "restricted", "channel_restricted"):
+        scores = _target_amplitude_scores_restricted(
+            trials,
+            channel_indices=channel_indices,
+        )
     else:
         # safe fallback
         scores = _target_amplitude_scores(trials)
@@ -398,7 +437,7 @@ def build_source_prototypes(
     subject_file: str,
     positive_label: int,
     background_label: int,
-    max_trials_per_class: int,
+    max_trials_per_class: Optional[int],
     min_trials_per_class: int,
     seed: int,
     cov_eps: float,
@@ -415,12 +454,14 @@ def build_source_prototypes(
     pos_idx = np.where(np.asarray(y) == int(positive_label))[0].astype(np.int64)
     bg_idx = np.where(np.asarray(y) == int(background_label))[0].astype(np.int64)
 
+    max_trials_norm = _normalize_max_trials(max_trials_per_class)
+
     pos_proto, pos_total, pos_used = _prototype_from_indices(
         subject_file=subject_file,
         indices=pos_idx,
         min_trials=int(min_trials_per_class),
         seed=int(seed),
-        max_trials=int(max_trials_per_class) if int(max_trials_per_class) > 0 else None,
+        max_trials=max_trials_norm,
         sample_salt=f"{subject_file}|label:{int(positive_label)}",
         cov_eps=float(cov_eps),
         cov_shrinkage=float(cov_shrinkage),
@@ -437,7 +478,7 @@ def build_source_prototypes(
         indices=bg_idx,
         min_trials=int(min_trials_per_class),
         seed=int(seed),
-        max_trials=int(max_trials_per_class) if int(max_trials_per_class) > 0 else None,
+        max_trials=max_trials_norm,
         sample_salt=f"{subject_file}|label:{int(background_label)}",
         cov_eps=float(cov_eps),
         cov_shrinkage=float(cov_shrinkage),
@@ -488,6 +529,7 @@ def build_target_prototype(
     target_max_trials: Optional[int],
     target_bg_mode: str,
     target_bg_ratio: float,
+    target_bg_channel_indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     x, y = _load_xy_memmap(target_subject_file)
     target_n = int(x.shape[0])
@@ -513,7 +555,7 @@ def build_target_prototype(
 
     cand_idx = _subsample_indices(
         cand_idx,
-        max_trials=int(target_max_trials) if target_max_trials not in (None, 0) else None,
+        max_trials=_normalize_max_trials(target_max_trials),
         seed=int(seed),
         salt=f"{target_subject_file}|target_candidates",
     )
@@ -523,6 +565,7 @@ def build_target_prototype(
         mode=str(target_bg_mode),
         ratio=float(target_bg_ratio),
         min_keep=max(1, int(min_trials_per_class)),
+        channel_indices=target_bg_channel_indices,
     )
     picked_idx = cand_idx[local_pick] if local_pick.size > 0 else cand_idx
 
@@ -682,7 +725,7 @@ def compute_pccs_source_scores(
     source_subject_files: Dict[str, str],
     positive_label: int = 1,
     background_label: int = 0,
-    max_trials_per_class: int = 128,
+    max_trials_per_class: Optional[int] = 128,  # <=0 means no cap
     min_trials_per_class: int = 4,
     seed: int = 2026,
     cov_eps: float = 1e-6,  # SPD regularization epsilon
@@ -701,6 +744,7 @@ def compute_pccs_source_scores(
     target_max_trials: Optional[int] = None,
     target_bg_mode: str = "amplitude",
     target_bg_ratio: float = 0.7,
+    target_bg_channel_indices: Optional[Sequence[int]] = None,
     tau_d: Optional[float] = None,
     tau_s: Optional[float] = None,
     tau_d_percentile: float = 30.0,
@@ -720,6 +764,7 @@ def compute_pccs_source_scores(
     # Enforce consistent metric for mean and distance.
     if metric != dist_metric:
         dist_metric = metric
+    max_trials_norm = _normalize_max_trials(max_trials_per_class)
 
     target_info = build_target_prototype(
         target_subject_file=target_subject_file,
@@ -739,6 +784,7 @@ def compute_pccs_source_scores(
         target_max_trials=target_max_trials,
         target_bg_mode=str(target_bg_mode),
         target_bg_ratio=float(target_bg_ratio),
+        target_bg_channel_indices=target_bg_channel_indices,
     )
     target_bg_proto = target_info.get("prototype", None)
     if target_bg_proto is None:
@@ -766,7 +812,7 @@ def compute_pccs_source_scores(
             subject_file=sub_file,
             positive_label=int(positive_label),
             background_label=int(background_label),
-            max_trials_per_class=int(max_trials_per_class),
+            max_trials_per_class=max_trials_norm,
             min_trials_per_class=int(min_trials_per_class),
             seed=int(seed),
             cov_eps=float(cov_eps),
@@ -866,7 +912,9 @@ def compute_pccs_source_scores(
         "config": {
             "positive_label": int(positive_label),
             "background_label": int(background_label),
-            "max_trials_per_class": int(max_trials_per_class),
+            "max_trials_per_class": (
+                None if max_trials_norm is None else int(max_trials_norm)
+            ),
             "min_trials_per_class": int(min_trials_per_class),
             "cov_eps": float(cov_eps),
             "cov_shrinkage": float(cov_shrinkage),
@@ -883,6 +931,11 @@ def compute_pccs_source_scores(
             "target_max_trials": None if target_max_trials is None else int(target_max_trials),
             "target_bg_mode": str(target_bg_mode),
             "target_bg_ratio": float(target_bg_ratio),
+            "target_bg_channel_indices": (
+                None
+                if target_bg_channel_indices is None
+                else [int(i) for i in target_bg_channel_indices]
+            ),
             "tau_d": gate_meta["tau_d"],
             "tau_s": gate_meta["tau_s"],
             "tau_d_source": gate_meta["tau_d_source"],

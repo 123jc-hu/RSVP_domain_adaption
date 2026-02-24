@@ -84,6 +84,24 @@ def _cast_optional(config: Dict[str, Any], fields, cast_fn) -> None:
             config[field] = None if _is_none_like(config[field]) else cast_fn(config[field])
 
 
+def _normalize_int_list(value: Any):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    if isinstance(value, str):
+        s = value.strip()
+        if _is_none_like(s):
+            return []
+        if s.startswith("[") and s.endswith("]"):
+            inner = s[1:-1].strip()
+            if not inner:
+                return []
+            return [int(x.strip()) for x in inner.split(",") if x.strip()]
+        return [int(x.strip()) for x in s.split(",") if x.strip()]
+    return [int(value)]
+
+
 def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
     config_path = os.path.join("Configs", "config.yaml")
     full_config = load_config(config_path)
@@ -170,6 +188,14 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
     optional_float_fields = ["source_selection_min_score"]
     _cast_optional(merged_config, optional_float_fields, float)
 
+    list_int_fields = [
+        "rpcs_target_bg_channel_indices",
+        "pccs_target_bg_channel_indices",
+    ]
+    for field in list_int_fields:
+        if field in merged_config:
+            merged_config[field] = _normalize_int_list(merged_config[field])
+
     bool_fields = [
         "is_training",
         "use_gpu",
@@ -189,4 +215,3 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
             merged_config[field] = _to_bool(merged_config[field])
 
     return merged_config
-
