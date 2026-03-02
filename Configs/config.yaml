@@ -22,6 +22,34 @@ psi_method: None           # Options: Tangent_Space | Time_Domain | None
 training_mode: End2End     # Options: Decoupled | End2End
 logit_adjustment: false
 pseudo_refinement: false
+lambda_align: 0.0
+alignment_loss: mmd        # currently supports: mmd
+
+# IAHM controls (imbalance-aware hyperbolic metric loss)
+iahm_enable: false
+iahm_curvature: -1.0
+iahm_r0: 1.0
+iahm_gamma: 1.0
+iahm_m0: 1.0
+iahm_margin_alpha: 0.25
+iahm_lambda_r: 1.0
+iahm_lambda_c: 0.5
+iahm_lambda_m: 1.0
+iahm_lambda_total: 1.0
+iahm_centroid_momentum: 0.1
+
+# RPT-Aug controls (parallel-transport target-positive synthesis)
+rpt_aug_enable: false
+rpt_aug_beta: 1.0
+rpt_aug_default_n_synth: 100
+rpt_aug_n_synth_per_batch: null
+rpt_aug_weighted_sampling: true
+rpt_aug_cov_eps: 1.0e-6
+rpt_aug_cov_estimator: sample      # sample | oas | lw
+rpt_aug_cov_shrinkage: 0.0
+rpt_aug_use_correlation: true
+rpt_aug_correlation_eps: 1.0e-12
+rpt_aug_input_layout: channel_first # channel_first | time_first | auto
 
 # Source selection controls
 source_selection_k: null
@@ -50,7 +78,7 @@ rpcs_score_mode: rpcs
 rpcs_score_eps: 1.0e-6
 rpcs_target_use_all_trials: true
 rpcs_target_max_trials: null
-rpcs_target_bg_mode: amplitude  # amplitude | kurtosis | all
+rpcs_target_bg_mode: amplitude  # amplitude | amplitude_restricted | kurtosis | all
 rpcs_target_bg_ratio: 0.7
 rpcs_target_bg_channel_indices: []  # used by amplitude_restricted mode
 rpcs_tau_d: null

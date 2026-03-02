@@ -94,16 +94,19 @@ class Model(nn.Module):
         return nn.Sequential(block1, block2)
 
     def classifier_block(self, input_size: int):
-        return nn.Sequential(
-            nn.Flatten(),
-            DenseWithConstraint(input_size, self.n_classes, bias=False, max_norm=0.25),
-        )
+        return DenseWithConstraint(input_size, self.n_classes, bias=False, max_norm=0.25)
 
-    def forward(self, x, train_stage: int = 2):
-        _ = train_stage
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.BasicBlock(x)
-        x = self.ClassifierBlock(x)
-        return x
+        return torch.flatten(x, start_dim=1)
+
+    def forward(self, x, train_stage: int = 2, return_features: bool = False):
+        _ = train_stage
+        features = self._forward_features(x)
+        logits = self.ClassifierBlock(features)
+        if return_features:
+            return logits, {"features": features}
+        return logits
 
 
 if __name__ == "__main__":

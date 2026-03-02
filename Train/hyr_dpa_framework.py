@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from Data.rpcs import compute_rpcs_source_scores
 
@@ -12,6 +12,9 @@ class HyRDPASettings:
     training_mode: str = "End2End"     # Decoupled | End2End
     logit_adjustment: bool = False
     pseudo_refinement: bool = False
+    iahm_enable: bool = False
+    rpt_aug_enable: bool = False
+    rpt_aug_beta: float = 1.0
 
     @classmethod
     def from_config(cls, cfg: Dict) -> "HyRDPASettings":
@@ -22,6 +25,9 @@ class HyRDPASettings:
             training_mode=str(cfg.get("training_mode", "End2End")),
             logit_adjustment=bool(cfg.get("logit_adjustment", False)),
             pseudo_refinement=bool(cfg.get("pseudo_refinement", False)),
+            iahm_enable=bool(cfg.get("iahm_enable", False)),
+            rpt_aug_enable=bool(cfg.get("rpt_aug_enable", False)),
+            rpt_aug_beta=float(cfg.get("rpt_aug_beta", 1.0)),
         )
 
 
@@ -42,7 +48,9 @@ class HyRDPAScaffold:
         return (
             f"source_selection={s.source_selection}, embedding_space={s.embedding_space}, "
             f"psi_method={s.psi_method}, training_mode={s.training_mode}, "
-            f"logit_adjustment={s.logit_adjustment}, pseudo_refinement={s.pseudo_refinement}"
+            f"logit_adjustment={s.logit_adjustment}, pseudo_refinement={s.pseudo_refinement}, "
+            f"iahm_enable={s.iahm_enable}, "
+            f"rpt_aug_enable={s.rpt_aug_enable}, rpt_aug_beta={s.rpt_aug_beta}"
         )
 
     def build_source_selection_inputs(
@@ -175,3 +183,37 @@ class HyRDPAScaffold:
         - optional pseudo-label consistency refinement
         """
         return
+
+    def build_rpt_aug_config(self) -> Dict[str, Any]:
+        """
+        Return normalized RPT-Aug config for fold-level integration.
+        """
+        cfg = self.config
+        return {
+            "enable": bool(cfg.get("rpt_aug_enable", False)),
+            "beta": float(cfg.get("rpt_aug_beta", 1.0)),
+            "default_n_synth": int(cfg.get("rpt_aug_default_n_synth", 100)),
+            "weighted_sampling": bool(cfg.get("rpt_aug_weighted_sampling", True)),
+            "cov_eps": float(cfg.get("rpt_aug_cov_eps", cfg.get("rpcs_cov_eps", 1e-6))),
+            "cov_estimator": str(cfg.get("rpt_aug_cov_estimator", cfg.get("rpcs_cov_estimator", "sample"))),
+            "cov_shrinkage": float(cfg.get("rpt_aug_cov_shrinkage", cfg.get("rpcs_cov_shrinkage", 0.0))),
+            "use_correlation": bool(cfg.get("rpt_aug_use_correlation", cfg.get("rpcs_use_correlation", True))),
+            "correlation_eps": float(cfg.get("rpt_aug_correlation_eps", cfg.get("rpcs_correlation_eps", 1e-12))),
+            "input_layout": str(cfg.get("rpt_aug_input_layout", cfg.get("rpcs_input_layout", "channel_first"))),
+        }
+
+    def build_iahm_config(self) -> Dict[str, Any]:
+        cfg = self.config
+        return {
+            "enable": bool(cfg.get("iahm_enable", False)),
+            "curvature": float(cfg.get("iahm_curvature", -1.0)),
+            "r0": float(cfg.get("iahm_r0", 1.0)),
+            "gamma": float(cfg.get("iahm_gamma", 1.0)),
+            "m0": float(cfg.get("iahm_m0", 1.0)),
+            "margin_alpha": float(cfg.get("iahm_margin_alpha", 0.25)),
+            "lambda_r": float(cfg.get("iahm_lambda_r", 1.0)),
+            "lambda_c": float(cfg.get("iahm_lambda_c", 0.5)),
+            "lambda_m": float(cfg.get("iahm_lambda_m", 1.0)),
+            "lambda_total": float(cfg.get("iahm_lambda_total", 1.0)),
+            "centroid_momentum": float(cfg.get("iahm_centroid_momentum", 0.1)),
+        }

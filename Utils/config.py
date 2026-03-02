@@ -133,14 +133,30 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
         "patience",
         "early_stop_start_epoch",
         "cosine_t_max",
+        "rpt_aug_default_n_synth",
     ]
     _cast_if_present(merged_config, int_fields, int)
 
     float_fields = [
         "learning_rate",
         "weight_decay",
+        "lambda_align",
         "cosine_eta_min_factor",
         "cosine_eta_min",
+        "iahm_curvature",
+        "iahm_r0",
+        "iahm_gamma",
+        "iahm_m0",
+        "iahm_margin_alpha",
+        "iahm_lambda_r",
+        "iahm_lambda_c",
+        "iahm_lambda_m",
+        "iahm_lambda_total",
+        "iahm_centroid_momentum",
+        "rpt_aug_beta",
+        "rpt_aug_cov_eps",
+        "rpt_aug_cov_shrinkage",
+        "rpt_aug_correlation_eps",
         "rpcs_mean_tol",
         "rpcs_cov_eps",
         "rpcs_cov_shrinkage",
@@ -165,6 +181,7 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
     _cast_if_present(merged_config, float_fields, float)
 
     optional_int_fields = [
+        "rpt_aug_n_synth_per_batch",
         "source_selection_k",
         "rpcs_top_k",
         "rpcs_target_max_trials",
@@ -203,6 +220,10 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
         "log_runtime",
         "class_weighted_ce",
         "use_target_stream",
+        "iahm_enable",
+        "rpt_aug_enable",
+        "rpt_aug_weighted_sampling",
+        "rpt_aug_use_correlation",
         "logit_adjustment",
         "pseudo_refinement",
         "rpcs_target_use_all_trials",

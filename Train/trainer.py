@@ -18,7 +18,9 @@ import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from Data.datamodule import EEGDataModuleCrossSubject
+from Data.rpt_aug import RPTAugmentor
 from Train.hyr_dpa_framework import HyRDPAScaffold
+from Train.iahm import IAHMLoss, euclidean_to_lorentz
 from Utils.config import set_random_seed
 from Utils.utils import load_from_checkpoint, EarlyStopping, SaveBestValBA
 from Utils.metrics import calculate_metrics, cal_F1_score
@@ -243,6 +245,98 @@ class OptimizedExperimentRunner:
             subject_file_map=subject_file_map,
         )
 
+    def _cfg_pref(self, pref_key: str, legacy_key: str, default):
+        if pref_key in self.config and self.config.get(pref_key) is not None:
+            return self.config.get(pref_key)
+        return self.config.get(legacy_key, default)
+
+    def _build_rpt_augmentor_for_fold(self, subject_id: int) -> Optional[RPTAugmentor]:
+        rpt_cfg = self.hyr_dpa.build_rpt_aug_config()
+        if not bool(rpt_cfg.get("enable", False)):
+            return None
+
+        meta = dict(getattr(self.hyr_dpa, "last_source_selection_meta", {}) or {})
+        details = dict(meta.get("details", {}) or {})
+        prototypes = dict(details.get("prototypes", {}) or {})
+        if not prototypes:
+            self.log.warning(
+                f"RPT-Aug enabled but R-PCS prototypes missing for sub{subject_id}; "
+                "disable RPT-Aug for this fold."
+            )
+            return None
+
+        selected_subjects = list(
+            (self.datamodule.source_selection_info or {}).get("selected_subjects", [])
+            or self.datamodule.source_subject_keys
+        )
+        if not selected_subjects:
+            self.log.warning(f"RPT-Aug enabled but selected source list is empty for sub{subject_id}.")
+            return None
+
+        pos_label = int(self._cfg_pref("rpcs_positive_label", "pccs_positive_label", 1))
+        bg_label = int(self._cfg_pref("rpcs_background_label", "pccs_background_label", 0))
+        max_src_pos = self._cfg_pref("rpcs_max_trials_per_class", "pccs_max_trials_per_class", None)
+        max_src_pos = None if max_src_pos in (None, "", "None", "none", "null", "NULL") else int(max_src_pos)
+        min_trials = int(self._cfg_pref("rpcs_min_trials_per_class", "pccs_min_trials_per_class", 4))
+
+        source_p300_trials = self.datamodule.get_source_positive_trials(
+            positive_label=pos_label,
+            subject_keys=selected_subjects,
+            max_trials_per_subject=max_src_pos,
+            seed=int(self.config.get("random_seed", 2026)),
+        )
+        if not source_p300_trials:
+            self.log.warning(f"RPT-Aug enabled but no source positive trials available for sub{subject_id}.")
+            return None
+
+        target_bg_trials = self.datamodule.get_target_background_trials(
+            background_label=bg_label,
+            target_use_all_trials=bool(
+                self._cfg_pref("rpcs_target_use_all_trials", "pccs_target_use_all_trials", True)
+            ),
+            target_max_trials=self._cfg_pref("rpcs_target_max_trials", "pccs_target_max_trials", None),
+            target_bg_mode=str(self._cfg_pref("rpcs_target_bg_mode", "pccs_target_bg_mode", "amplitude")),
+            target_bg_ratio=float(self._cfg_pref("rpcs_target_bg_ratio", "pccs_target_bg_ratio", 0.7)),
+            target_bg_channel_indices=self._cfg_pref(
+                "rpcs_target_bg_channel_indices",
+                "pccs_target_bg_channel_indices",
+                None,
+            ),
+            min_keep=max(1, min_trials),
+            seed=int(self.config.get("random_seed", 2026)),
+        )
+        if int(target_bg_trials.shape[0]) <= 0:
+            self.log.warning(f"RPT-Aug enabled but no target background trials available for sub{subject_id}.")
+            return None
+
+        ranking = list(details.get("ranking", []) or [])
+        rpcs_result = {
+            "prototypes": prototypes,
+            "ranking": ranking,
+            "scores": {str(r.get("subject")): float(r.get("score", 1.0)) for r in ranking},
+        }
+        augmentor = RPTAugmentor(
+            rpcs_result=rpcs_result,
+            source_p300_trials=source_p300_trials,
+            target_bg_trials=target_bg_trials,
+            selected_subjects=selected_subjects,
+            beta=float(rpt_cfg.get("beta", 1.0)),
+            cov_eps=float(rpt_cfg.get("cov_eps", 1e-6)),
+            use_correlation=bool(rpt_cfg.get("use_correlation", True)),
+            correlation_eps=float(rpt_cfg.get("correlation_eps", 1e-12)),
+            cov_estimator=str(rpt_cfg.get("cov_estimator", "sample")),
+            cov_shrinkage=float(rpt_cfg.get("cov_shrinkage", 0.0)),
+            input_layout=str(rpt_cfg.get("input_layout", "channel_first")),
+            rpcs_weighted_sampling=bool(rpt_cfg.get("weighted_sampling", True)),
+        )
+        augmentor.prepare()
+        self.log.info(
+            f"RPT-Aug ready for sub{subject_id} | selected_sources={len(selected_subjects)} "
+            f"| source_pos_trials={sum(int(v.shape[0]) for v in source_p300_trials.values())} "
+            f"| target_bg_trials={int(target_bg_trials.shape[0])}"
+        )
+        return augmentor
+
     def _dataset_dir(self) -> Path:
         """Resolve dataset directory path for current dataset and sampling rate."""
         cfg = self.config
@@ -282,6 +376,14 @@ class OptimizedExperimentRunner:
             )
             self.log.info(f"Subject {subject_id} source class weights: {class_weights.detach().cpu().tolist()}")
 
+        rpt_augmentor = self._build_rpt_augmentor_for_fold(subject_id)
+        iahm_cfg = self.hyr_dpa.build_iahm_config()
+        source_class_counts = (
+            self.datamodule.source_train_class_counts.tolist()
+            if self.datamodule.source_train_class_counts is not None
+            else None
+        )
+
         optimizer, scheduler, early, save_ba = self._configure_training_components(model)
 
         trainer = OptimizedTrainer(
@@ -294,6 +396,13 @@ class OptimizedExperimentRunner:
             device=self.device,
             logger=self.log,
             class_weights=class_weights,
+        )
+        trainer.configure_stage1_modules(
+            rpt_augmentor=rpt_augmentor,
+            iahm_cfg=iahm_cfg,
+            source_class_counts=source_class_counts,
+            positive_label=int(self._cfg_pref("rpcs_positive_label", "pccs_positive_label", 1)),
+            background_label=int(self._cfg_pref("rpcs_background_label", "pccs_background_label", 0)),
         )
 
         ckpt_dir, log_dir = self._prepare_dirs(subject_id)
@@ -320,6 +429,10 @@ class OptimizedExperimentRunner:
         cfg = self.config
         batch_size = int(cfg["batch_size"])
         use_target_stream = bool(cfg.get("use_target_stream", False))
+        need_target_stream = bool(cfg.get("rpt_aug_enable", False)) or float(cfg.get("lambda_align", 0.0)) > 0.0
+        if need_target_stream and not use_target_stream:
+            use_target_stream = True
+            self.log.info("Stage-1 alignment enabled -> force `use_target_stream=True` for training.")
         if use_target_stream:
             train_loader = self.datamodule.train_dataloader(batch_size=batch_size)
         else:
@@ -793,6 +906,20 @@ class OptimizedTrainer:
         self.rt_deadline_ms: float = float(self.config.get("rt_deadline_ms", 200.0))
         self.last_runtime_stats: dict | None = None
 
+        # Stage-1 optional modules (RPT-Aug + IAHM)
+        self.stage1_rpt_augmentor: Optional[RPTAugmentor] = None
+        self.stage1_iahm_cfg: Dict[str, Any] = {}
+        self.stage1_source_class_counts: Optional[List[int]] = None
+        self.stage1_positive_label: int = 1
+        self.stage1_background_label: int = 0
+        self.stage1_iahm_loss: Optional[IAHMLoss] = None
+        self.stage1_global_step: int = 0
+
+        self.lambda_align: float = float(self.config.get("lambda_align", 0.0))
+        self.alignment_loss_name: str = str(self.config.get("alignment_loss", "mmd")).strip().lower()
+        self.rpt_synth_per_batch_cfg = self.config.get("rpt_aug_n_synth_per_batch", None)
+        self._alignment_warned = False
+
     def _log_info(self, msg: str):
         if self.logger is not None:
             self.logger.info(msg)
@@ -810,6 +937,27 @@ class OptimizedTrainer:
         stage_suffix = f"-{stage}"
         self.earlystopping.path = checkpoint_dir / f"best_model-{stage_suffix}.pth"
         self.save_other_model.path = checkpoint_dir / f"best_ba_model-{stage_suffix}.pth"
+
+    def configure_stage1_modules(
+        self,
+        *,
+        rpt_augmentor: Optional[RPTAugmentor],
+        iahm_cfg: Optional[Dict[str, Any]],
+        source_class_counts: Optional[List[int]],
+        positive_label: int = 1,
+        background_label: int = 0,
+    ) -> None:
+        self.stage1_rpt_augmentor = rpt_augmentor
+        self.stage1_iahm_cfg = dict(iahm_cfg or {})
+        self.stage1_source_class_counts = (
+            [int(v) for v in source_class_counts]
+            if source_class_counts is not None
+            else None
+        )
+        self.stage1_positive_label = int(positive_label)
+        self.stage1_background_label = int(background_label)
+        self.stage1_iahm_loss = None
+        self.stage1_global_step = 0
 
     def fit(self, train_loader, val_loader, stage: int, epochs: int):
         patience = int(self.config.get("patience", 20))
@@ -861,6 +1009,196 @@ class OptimizedTrainer:
                     self.model.step_epoch(1)
 
 
+    def _stage1_has_aux(self) -> bool:
+        has_rpt = self.stage1_rpt_augmentor is not None
+        has_iahm = bool(self.stage1_iahm_cfg.get("enable", False))
+        has_align = float(self.lambda_align) > 0.0
+        return has_rpt or has_iahm or has_align
+
+    def _zero_tensor(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32, device=self.device)
+
+    def _ensure_iahm_loss(self, embed_dim: int) -> Optional[IAHMLoss]:
+        cfg = dict(self.stage1_iahm_cfg or {})
+        if not bool(cfg.get("enable", False)):
+            return None
+        if self.stage1_iahm_loss is not None:
+            return self.stage1_iahm_loss
+
+        n_classes = int(self.config.get("n_class", 2))
+        class_counts = self.stage1_source_class_counts
+        if class_counts is None or len(class_counts) < n_classes:
+            class_counts = [1 for _ in range(n_classes)]
+        else:
+            class_counts = list(class_counts[:n_classes])
+
+        self.stage1_iahm_loss = IAHMLoss(
+            n_classes=n_classes,
+            embed_dim=int(embed_dim),
+            curvature=float(cfg.get("curvature", -1.0)),
+            class_counts=class_counts,
+            r0=float(cfg.get("r0", 1.0)),
+            gamma=float(cfg.get("gamma", 1.0)),
+            m0=float(cfg.get("m0", 1.0)),
+            margin_alpha=float(cfg.get("margin_alpha", 0.25)),
+            lambda_r=float(cfg.get("lambda_r", 1.0)),
+            lambda_c=float(cfg.get("lambda_c", 0.5)),
+            lambda_m=float(cfg.get("lambda_m", 1.0)),
+            centroid_momentum=float(cfg.get("centroid_momentum", 0.1)),
+        ).to(self.device)
+        self._log_info(
+            "IAHM initialized | "
+            f"embed_dim={embed_dim} | "
+            f"class_counts={class_counts} | "
+            f"curvature={cfg.get('curvature', -1.0)}"
+        )
+        return self.stage1_iahm_loss
+
+    def _mmd_rbf(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        y_weights: Optional[torch.Tensor] = None,
+        sigma: float = 1.0,
+    ) -> torch.Tensor:
+        if x is None or y is None or x.numel() == 0 or y.numel() == 0:
+            return self._zero_tensor()
+        if x.ndim != 2 or y.ndim != 2:
+            return self._zero_tensor()
+
+        def _kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            a2 = torch.sum(a * a, dim=1, keepdim=True)
+            b2 = torch.sum(b * b, dim=1, keepdim=True).T
+            dist2 = torch.clamp(a2 + b2 - 2.0 * (a @ b.T), min=0.0)
+            denom = 2.0 * max(float(sigma) ** 2, 1e-12)
+            return torch.exp(-dist2 / denom)
+
+        k_xx = _kernel(x, x)
+        term_xx = torch.mean(k_xx)
+        k_xy = _kernel(x, y)
+        k_yy = _kernel(y, y)
+
+        if y_weights is None:
+            term_xy = torch.mean(k_xy)
+            term_yy = torch.mean(k_yy)
+        else:
+            w = y_weights.reshape(-1).to(y.device, dtype=y.dtype)
+            w = torch.clamp(w, min=0.0)
+            ws = torch.sum(w)
+            if float(ws.detach().item()) <= 0.0:
+                w = torch.ones_like(w)
+                ws = torch.sum(w)
+            w = w / ws
+            term_xy = torch.mean(torch.sum(k_xy * w.unsqueeze(0), dim=1))
+            term_yy = torch.sum(k_yy * (w.unsqueeze(1) * w.unsqueeze(0)))
+        return term_xx + term_yy - 2.0 * term_xy
+
+    def _stage1_aux_losses(
+        self,
+        *,
+        source_embed: torch.Tensor,
+        source_labels: torch.Tensor,
+        target_x: Optional[torch.Tensor],
+        training: bool,
+    ) -> Tuple[torch.Tensor, OrderedDict]:
+        """
+        Optional Stage-1 auxiliary losses:
+        - class-conditional alignment (MMD) using source/target and RPT-Aug synth positives
+        - IAHM on Lorentz embeddings (source + optional synth positives)
+        """
+        if not self._stage1_has_aux():
+            return self._zero_tensor(), OrderedDict()
+
+        aux_items = OrderedDict()
+        curv = float((self.stage1_iahm_cfg or {}).get("curvature", -1.0))
+        z_src = euclidean_to_lorentz(source_embed.float(), K=curv)
+
+        # Target embeddings for negative/background alignment branch.
+        z_tgt = None
+        if target_x is not None:
+            if len(target_x.shape) == 3:
+                target_x = target_x.unsqueeze(1)
+            target_logits, target_extras = self._forward_unpack(target_x)
+            target_embed = self._select_hyperbolic_input(target_logits, target_extras)
+            z_tgt = euclidean_to_lorentz(target_embed.float(), K=curv)
+
+        z_rpt = None
+        w_rpt = None
+        if self.stage1_rpt_augmentor is not None:
+            n_cfg = self.rpt_synth_per_batch_cfg
+            if n_cfg in (None, "", "None", "none", "null", "NULL"):
+                n_pos = int((source_labels == int(self.stage1_positive_label)).sum().detach().item())
+                n_synth = max(1, n_pos)
+            else:
+                n_synth = max(1, int(n_cfg))
+            synth = self.stage1_rpt_augmentor.sample(
+                n=int(n_synth),
+                seed=int(self.current_epoch * 100000 + self.stage1_global_step),
+            )
+            x_rpt_np = np.asarray(synth.get("trials", np.empty((0,))), dtype=np.float32)
+            if x_rpt_np.ndim == 3 and int(x_rpt_np.shape[0]) > 0:
+                x_rpt = torch.from_numpy(x_rpt_np).to(self.device)
+                if len(x_rpt.shape) == 3:
+                    x_rpt = x_rpt.unsqueeze(1)
+                synth_logits, synth_extras = self._forward_unpack(x_rpt)
+                synth_embed = self._select_hyperbolic_input(synth_logits, synth_extras)
+                z_rpt = euclidean_to_lorentz(synth_embed.float(), K=curv)
+                w = np.asarray(synth.get("weights", np.ones((x_rpt_np.shape[0],))), dtype=np.float32)
+                w_rpt = torch.from_numpy(w).to(self.device)
+
+        # Alignment loss (class-conditional)
+        loss_align = self._zero_tensor()
+        if float(self.lambda_align) > 0.0:
+            if self.alignment_loss_name not in ("mmd",):
+                if not self._alignment_warned:
+                    self._log_info(
+                        f"Unsupported alignment_loss={self.alignment_loss_name}, fallback to mmd."
+                    )
+                    self._alignment_warned = True
+            pos_mask = (source_labels == int(self.stage1_positive_label))
+            neg_mask = (source_labels == int(self.stage1_background_label))
+            z_s_pos = z_src[pos_mask]
+            z_s_neg = z_src[neg_mask]
+
+            loss_align_pos = self._zero_tensor()
+            if z_rpt is not None and z_rpt.numel() > 0 and z_s_pos.numel() > 0:
+                loss_align_pos = self._mmd_rbf(z_s_pos, z_rpt, y_weights=w_rpt)
+
+            loss_align_neg = self._zero_tensor()
+            if z_tgt is not None and z_tgt.numel() > 0 and z_s_neg.numel() > 0:
+                loss_align_neg = self._mmd_rbf(z_s_neg, z_tgt, y_weights=None)
+
+            loss_align = loss_align_pos + loss_align_neg
+            aux_items["align_pos"] = float(loss_align_pos.detach().item())
+            aux_items["align_neg"] = float(loss_align_neg.detach().item())
+            aux_items["align"] = float(loss_align.detach().item())
+
+        # IAHM loss (source + synthetic positive)
+        loss_iahm = self._zero_tensor()
+        iahm_fn = self._ensure_iahm_loss(embed_dim=int(z_src.shape[1] - 1))
+        if iahm_fn is not None:
+            if z_rpt is not None and z_rpt.numel() > 0:
+                y_rpt = torch.full(
+                    (int(z_rpt.shape[0]),),
+                    int(self.stage1_positive_label),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                z_all = torch.cat([z_src, z_rpt], dim=0)
+                y_all = torch.cat([source_labels.long(), y_rpt], dim=0)
+            else:
+                z_all = z_src
+                y_all = source_labels.long()
+            loss_iahm, iahm_items = iahm_fn(z_all, y_all, update_centroids=bool(training))
+            aux_items["iahm"] = float(loss_iahm.detach().item())
+            for k, v in iahm_items.items():
+                aux_items[f"iahm_{k}"] = float(v)
+
+        lambda_iahm = float((self.stage1_iahm_cfg or {}).get("lambda_total", 1.0))
+        aux_total = float(self.lambda_align) * loss_align + lambda_iahm * loss_iahm
+        aux_items["aux_total"] = float(aux_total.detach().item())
+        return aux_total, aux_items
+
     # ---------- epoch core ----------
     def _run_epoch(self, dataloader, *, training: bool, loss_fn: Callable):
         """
@@ -886,11 +1224,17 @@ class OptimizedTrainer:
 
         with maybe_no_grad():
             for batch in dataloader:
+                self.stage1_global_step += 1
                 n_batches += 1
                 t0 = _t.perf_counter()
 
+                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                    raise ValueError("Batch must be (x, y) or (x, y, target_x).")
                 x = batch[0].to(self.device, non_blocking=True)
                 y = batch[1].to(self.device, non_blocking=True)
+                target_x = None
+                if len(batch) >= 3 and batch[2] is not None:
+                    target_x = batch[2].to(self.device, non_blocking=True)
                 sample_count += x.size(0)
                 if len(x.shape) == 3:
                     x = x.unsqueeze(1)
@@ -905,6 +1249,19 @@ class OptimizedTrainer:
                 with autocast():
                     logits, extras = self._forward_unpack(x)
                     loss_total, items = loss_fn(logits, y, extras)
+                    if training and self._stage1_has_aux():
+                        source_embed = self._select_hyperbolic_input(logits, extras)
+                        aux_loss, aux_items = self._stage1_aux_losses(
+                            source_embed=source_embed,
+                            source_labels=y,
+                            target_x=target_x,
+                            training=training,
+                        )
+                        loss_total = loss_total + aux_loss
+                        merged = OrderedDict(items)
+                        for k, v in aux_items.items():
+                            merged[k] = float(v)
+                        items = merged
                     probs = torch.softmax(logits, dim=1)
                     preds = logits.argmax(1)
 
@@ -1019,14 +1376,57 @@ class OptimizedTrainer:
         ce = self._cross_entropy(logits, y)
         return ce, OrderedDict([("ce", float(ce.detach().item()))])
 
+    def _select_hyperbolic_input(self, logits: torch.Tensor, extras: Any) -> torch.Tensor:
+        """
+        Prefer penultimate features if model exposes them; fallback to logits.
+        """
+        if extras is None:
+            return logits
+
+        # Case 1: extras is dict.
+        if isinstance(extras, dict):
+            feat = extras.get("features", None)
+            if isinstance(feat, torch.Tensor):
+                return feat
+            return logits
+
+        # Case 2: extras packed in tuple/list (legacy unpack path).
+        if isinstance(extras, (tuple, list)) and len(extras) > 0:
+            # Single dict payload: ({'features': ...},)
+            if len(extras) == 1 and isinstance(extras[0], dict):
+                feat = extras[0].get("features", None)
+                if isinstance(feat, torch.Tensor):
+                    return feat
+            # First tensor payload fallback.
+            if isinstance(extras[0], torch.Tensor):
+                return extras[0]
+        return logits
+
     def _forward_unpack(self, x):
-        try:
-            out = self.model(x)
-        except TypeError:
-            out = self.model(x, 2)
+        out = None
+        # Prefer requesting features from backbone if supported.
+        tried = []
+        for call in (
+            lambda: self.model(x, return_features=True),
+            lambda: self.model(x),
+            lambda: self.model(x, 2, True),
+            lambda: self.model(x, 2),
+        ):
+            try:
+                out = call()
+                break
+            except TypeError as e:
+                tried.append(str(e))
+                continue
+        if out is None:
+            # Re-raise with compact context.
+            raise TypeError(f"Model forward call failed after fallbacks: {tried[:2]} ...")
         if isinstance(out, tuple):
             logits = out[0]
-            extras = out[1:]
+            if len(out) == 2 and isinstance(out[1], dict):
+                extras = out[1]
+            else:
+                extras = out[1:]
         else:
             logits = out
             extras = None

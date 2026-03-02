@@ -75,14 +75,12 @@ class Model(nn.Module):
             nn.ELU(),
             nn.AvgPool2d((1, 2), stride=(1, 2)),
             nn.Dropout(p=self.dropout_rate),
-            nn.Flatten(),
-            nn.Linear(24, self.n_classes),
         )
+        self.classifier = nn.Linear(24, self.n_classes)
 
         self.AvgPool2d = nn.AvgPool2d((1, 4), stride=(1, 4))
 
-    def forward(self, x, train_stage: int = 2):
-        _ = train_stage
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x1 = self.Inception1_branch1(x)
         x2 = self.Inception1_branch2(x)
         x3 = self.Inception1_branch3(x)
@@ -93,8 +91,15 @@ class Model(nn.Module):
         x2 = self.Inception2_branch2(x)
         x3 = self.Inception2_branch3(x)
         x = torch.cat([x1, x2, x3], dim=1)
+        x = self.output_module(x)
+        return torch.flatten(x, start_dim=1)
 
-        logits = self.output_module(x)
+    def forward(self, x, train_stage: int = 2, return_features: bool = False):
+        _ = train_stage
+        features = self._forward_features(x)
+        logits = self.classifier(features)
+        if return_features:
+            return logits, {"features": features}
         return logits
 
 

@@ -33,15 +33,20 @@ class Model(nn.Module):
         )
 
         self.ClassifierBlock = nn.Sequential(
-            nn.Flatten(),
             nn.Linear(self.BasicBlockOutputSize, self.n_classes),
         )
 
-    def forward(self, x, train_stage: int = 2):
-        _ = train_stage
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.Block1(x)
         x = self.Block2(x)
-        logits = self.ClassifierBlock(x)
+        return torch.flatten(x, start_dim=1)
+
+    def forward(self, x, train_stage: int = 2, return_features: bool = False):
+        _ = train_stage
+        features = self._forward_features(x)
+        logits = self.ClassifierBlock(features)
+        if return_features:
+            return logits, {"features": features}
         return logits
 
 

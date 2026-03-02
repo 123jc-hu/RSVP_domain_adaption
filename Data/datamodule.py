@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from Data.npz_io import ensure_npz_cache
+from Data.pccs import select_target_bg_subset_indices
 from Data.source_selection import (
     SelectionManager,
     normalize_score_map,
@@ -417,6 +418,104 @@ class EEGDataModuleCrossSubject:
         if device is not None:
             t = t.to(device)
         return t
+
+    def _load_subject_memmap(self, subject_key: str) -> Tuple[np.ndarray, np.ndarray]:
+        if self.subject_file_map is None:
+            raise RuntimeError("Call prepare_data() first.")
+        skey = normalize_subject_key(subject_key)
+        if skey not in self.subject_file_map:
+            raise KeyError(f"Unknown subject key: {subject_key}")
+        subject_file = self.subject_file_map[skey]
+        cache_dir = ensure_npz_cache(Path(subject_file), ["x_data.npy", "y_data.npy"])
+        x = np.load(cache_dir / "x_data.npy", mmap_mode="r")
+        y = np.load(cache_dir / "y_data.npy", mmap_mode="r")
+        return x, y
+
+    def get_subject_trials_by_label(
+        self,
+        *,
+        subject_key: str,
+        label: int,
+        max_trials: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Return trials of one subject for one label as ndarray [N, C, T].
+        """
+        x, y = self._load_subject_memmap(subject_key)
+        idx = np.where(np.asarray(y) == int(label))[0].astype(np.int64)
+        if max_trials is not None and int(max_trials) > 0 and idx.size > int(max_trials):
+            rng = np.random.default_rng(self.seed if seed is None else int(seed))
+            idx = rng.choice(idx, size=int(max_trials), replace=False).astype(np.int64)
+        return np.asarray(x[idx], dtype=np.float32)
+
+    def get_source_positive_trials(
+        self,
+        *,
+        positive_label: int = 1,
+        subject_keys: Optional[List[str]] = None,
+        max_trials_per_subject: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Return source-domain positive trials per subject:
+        {sub_key: [N_i, C, T]}.
+        """
+        keys = list(subject_keys) if subject_keys is not None else list(self.source_subject_keys)
+        out: Dict[str, np.ndarray] = {}
+        for idx, sub in enumerate(keys):
+            data = self.get_subject_trials_by_label(
+                subject_key=sub,
+                label=int(positive_label),
+                max_trials=max_trials_per_subject,
+                seed=(self.seed + idx) if seed is None else (int(seed) + idx),
+            )
+            if data.ndim == 3 and int(data.shape[0]) > 0:
+                out[str(sub)] = data
+        return out
+
+    def get_target_background_trials(
+        self,
+        *,
+        background_label: int = 0,
+        target_use_all_trials: bool = True,
+        target_max_trials: Optional[int] = None,
+        target_bg_mode: str = "amplitude",
+        target_bg_ratio: float = 0.7,
+        target_bg_channel_indices: Optional[List[int]] = None,
+        min_keep: int = 8,
+        seed: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Return target-domain background-like trial subset [N, C, T].
+        """
+        if self.test_subject_id is None:
+            raise RuntimeError("Call prepare_data() first.")
+        target_key = f"sub{int(self.test_subject_id)}"
+        x, y = self._load_subject_memmap(target_key)
+        n = int(x.shape[0])
+
+        if bool(target_use_all_trials):
+            cand_idx = np.arange(n, dtype=np.int64)
+        else:
+            cand_idx = np.where(np.asarray(y) == int(background_label))[0].astype(np.int64)
+        if cand_idx.size == 0:
+            return np.empty((0,) + tuple(x.shape[1:]), dtype=np.float32)
+
+        if target_max_trials is not None and int(target_max_trials) > 0 and cand_idx.size > int(target_max_trials):
+            rng = np.random.default_rng(self.seed if seed is None else int(seed))
+            cand_idx = rng.choice(cand_idx, size=int(target_max_trials), replace=False).astype(np.int64)
+
+        candidate_trials = np.asarray(x[cand_idx], dtype=np.float64)
+        local_pick = select_target_bg_subset_indices(
+            trials=candidate_trials,
+            mode=str(target_bg_mode),
+            ratio=float(target_bg_ratio),
+            min_keep=max(1, int(min_keep)),
+            channel_indices=target_bg_channel_indices,
+        )
+        picked = cand_idx[local_pick] if int(local_pick.size) > 0 else cand_idx
+        return np.asarray(x[picked], dtype=np.float32)
 
     def _load_subject_labels(self, subject_file: str) -> np.ndarray:
         subject_file = str(subject_file)
