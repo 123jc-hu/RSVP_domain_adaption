@@ -12,7 +12,7 @@ train_mode: cross-subject
 data_mix: true
 class_weighted_ce: true
 use_target_stream: false
-dataset_root: E:/learning_projects/few-shot-learning_RSVP/Dataset
+dataset_root: /home/cdd/datasets/learning_projects/few-shot-learning_RSVP/Dataset
 cosine_eta_min_factor: 0.01
 
 # HyR-DPA framework switches (scaffold stage)

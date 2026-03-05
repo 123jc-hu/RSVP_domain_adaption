@@ -18,6 +18,7 @@ import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from Data.datamodule import EEGDataModuleCrossSubject
+from Data.path_resolver import resolve_dataset_dir
 from Data.rpt_aug import RPTAugmentor
 from Train.hyr_dpa_framework import HyRDPAScaffold
 from Train.iahm import IAHMLoss, euclidean_to_lorentz
@@ -338,18 +339,7 @@ class OptimizedExperimentRunner:
         return augmentor
 
     def _dataset_dir(self) -> Path:
-        """Resolve dataset directory path for current dataset and sampling rate."""
-        cfg = self.config
-        root = Path(
-            cfg.get(
-                "dataset_root",
-                os.environ.get("RSVP_DATASET_ROOT", "E:/learning_projects/few-shot-learning_RSVP/Dataset"),
-            )
-        )
-        if "_" in cfg["dataset"]:
-            dataset, task = cfg["dataset"].split("_")
-            return root / dataset / f"Standard_{cfg['fs']}Hz" / f"task{task}"
-        return root / cfg["dataset"] / f"Standard_{cfg['fs']}Hz"
+        return resolve_dataset_dir(self.config)
 
     def _run_subject(self, subject_id: int) -> Dict[str, float]:
         """Train/evaluate one LOSO subject and return rounded metrics."""
