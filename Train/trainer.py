@@ -160,6 +160,19 @@ class OptimizedExperimentRunner:
         dataset_dir = self._dataset_dir()
 
         subject_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith(".npz") and "_10band" not in f])
+        if not subject_files:
+            raise RuntimeError(f"No subject .npz files found in dataset directory: {dataset_dir}")
+
+        fold_files = list(subject_files)
+        n_fold = self.config.get("n_fold", None)
+        if n_fold not in (None, "", "None", "none", "null", "NULL"):
+            n_fold = int(n_fold)
+            if n_fold > 0:
+                fold_files = fold_files[: min(n_fold, len(fold_files))]
+                self.log.info(
+                    f"Quick-fold mode enabled | n_fold={n_fold} | running {len(fold_files)}/{len(subject_files)} held-out subjects"
+                )
+
         subject_file_map = {}
         for filename in subject_files:
             m = re.search(r"sub(\d+)", filename)
@@ -173,7 +186,7 @@ class OptimizedExperimentRunner:
         metric_history = {k: [] for k in ["AUC", "BA", "F1", "TPR", "FPR"]}
 
         with MemoryManager.cuda_memory_context():
-            for filename in subject_files:
+            for filename in fold_files:
                 set_random_seed(int(self.config.get("random_seed", 2026)))
 
                 m = re.search(r"sub(\d+)", filename)
@@ -428,9 +441,15 @@ class OptimizedExperimentRunner:
         else:
             train_loader = self.datamodule.source_train_dataloader(batch_size=batch_size)
         val_loader = self.datamodule.val_dataloader(batch_size=batch_size)
+        train_steps = len(train_loader) if hasattr(train_loader, "__len__") else None
         self.log.info(
             f"Training setup | use_target_stream={use_target_stream} | "
-            f"train_samples={len(self.datamodule.train_dataset)} | val_samples={len(self.datamodule.val_dataset)}"
+            f"train_samples={len(self.datamodule.train_dataset)} | "
+            f"val_samples={len(self.datamodule.val_dataset)} | "
+            f"train_steps={train_steps} | "
+            f"subject_batch_policy={getattr(self.datamodule, 'train_subject_batch_policy', None)} | "
+            f"subjects_per_batch={getattr(self.datamodule, 'train_subjects_per_batch', None)} | "
+            f"subject_batch_size={getattr(self.datamodule, 'train_subject_batch_size', None)}"
         )
 
         trainer.fit(train_loader, val_loader, stage=2, epochs=int(cfg["epochs"]))

@@ -13,6 +13,20 @@ data_mix: true
 class_weighted_ce: true
 use_target_stream: false
 dataset_root: /home/cdd/datasets/learning_projects/few-shot-learning_RSVP/Dataset
+# Subject-wise training batch policy (fair K-subject comparison)
+# global_train_batch = subjects_per_batch * subject_batch_size
+subject_batching: true
+subject_batch_size: 32        # b: samples per selected subject in one training step
+subjects_per_batch: 32         # K: number of source subjects sampled per training step
+all_source_batch_policy: random_k  # All-Source mode: random_k (random K each step) | fixed_k
+epoch_step_reference: all_candidates  # all_candidates | selected_sources
+epoch_steps_override: null    # set int to force fixed steps/epoch, null means auto-compute
+
+# DataLoader I/O tuning (especially useful when dataset is on NTFS mount)
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
 cosine_eta_min_factor: 0.01
 
 # HyR-DPA framework switches (scaffold stage)

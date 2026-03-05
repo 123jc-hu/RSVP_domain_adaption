@@ -52,9 +52,10 @@ class NPZMemmapSubsetDataset(Dataset):
 
     def __getitem__(self, idx):
         real_idx = int(self.indices[idx])
-        x = self.x_data[real_idx]
+        # Copy to writable ndarray before torch conversion to avoid memmap readonly warning.
+        x = np.asarray(self.x_data[real_idx], dtype=np.float32).copy()
         y = int(self.y_data[real_idx])
-        return torch.from_numpy(x).float(), torch.tensor(y).long()
+        return torch.from_numpy(x), torch.tensor(y).long()
 
     @staticmethod
     def _ensure_npz_cache(npz_path: Path, members: List[str]) -> Path:
@@ -117,6 +118,120 @@ class DualStreamDataLoader:
             yield source_x, source_y, target_x
 
 
+class SubjectBatchDataLoader:
+    """
+    Subject-aware batch loader.
+
+    One step yields:
+    - choose subject keys (fixed K keys OR random K keys each step)
+    - sample `per_subject_batch_size` trials from each subject
+    - concatenate into global batch of size `subjects_per_batch * per_subject_batch_size`
+    """
+
+    def __init__(
+        self,
+        *,
+        subject_datasets: Dict[str, NPZMemmapSubsetDataset],
+        subject_keys_for_sampling: List[str],
+        subjects_per_batch: int,
+        per_subject_batch_size: int,
+        steps_per_epoch: int,
+        random_subjects_each_step: bool,
+        seed: int = 2026,
+        pin_memory: bool = False,
+    ):
+        if not subject_datasets:
+            raise ValueError("subject_datasets must be non-empty.")
+        if subjects_per_batch <= 0:
+            raise ValueError("subjects_per_batch must be > 0.")
+        if per_subject_batch_size <= 0:
+            raise ValueError("per_subject_batch_size must be > 0.")
+        if steps_per_epoch <= 0:
+            raise ValueError("steps_per_epoch must be > 0.")
+        if not subject_keys_for_sampling:
+            raise ValueError("subject_keys_for_sampling must be non-empty.")
+
+        self.subject_datasets = dict(subject_datasets)
+        self.subject_keys_for_sampling = list(subject_keys_for_sampling)
+        self.subjects_per_batch = int(subjects_per_batch)
+        self.per_subject_batch_size = int(per_subject_batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.random_subjects_each_step = bool(random_subjects_each_step)
+        self.seed = int(seed)
+        self.pin_memory = bool(pin_memory)
+
+        if self.random_subjects_each_step and self.subjects_per_batch > len(self.subject_keys_for_sampling):
+            raise ValueError(
+                f"subjects_per_batch={self.subjects_per_batch} is larger than sampling pool={len(self.subject_keys_for_sampling)}."
+            )
+        if (not self.random_subjects_each_step) and self.subjects_per_batch > len(self.subject_keys_for_sampling):
+            raise ValueError(
+                f"subjects_per_batch={self.subjects_per_batch} requires at least that many fixed subject keys."
+            )
+
+        self._epoch = 0
+
+        # Keep DataLoader-like attributes for compatibility.
+        self.batch_size = self.subjects_per_batch * self.per_subject_batch_size
+        self.dataset = subject_datasets
+        self.drop_last = True
+        self.num_workers = 0
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def _pick_subjects(self, rng: np.random.Generator) -> List[str]:
+        if self.random_subjects_each_step:
+            idx = rng.choice(
+                len(self.subject_keys_for_sampling),
+                size=self.subjects_per_batch,
+                replace=False,
+            )
+            return [self.subject_keys_for_sampling[int(i)] for i in idx]
+        return list(self.subject_keys_for_sampling[: self.subjects_per_batch])
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+
+        for _ in range(self.steps_per_epoch):
+            chosen_subjects = self._pick_subjects(rng)
+            x_parts: List[torch.Tensor] = []
+            y_parts: List[torch.Tensor] = []
+
+            for skey in chosen_subjects:
+                ds = self.subject_datasets[skey]
+                n = len(ds)
+                if n <= 0:
+                    continue
+
+                local_idx = rng.integers(0, n, size=self.per_subject_batch_size, endpoint=False)
+                real_idx = ds.indices[local_idx]
+
+                x_np = np.asarray(ds.x_data[real_idx], dtype=np.float32)
+                y_np = np.asarray(ds.y_data[real_idx], dtype=np.int64)
+
+                x_parts.append(torch.from_numpy(x_np))
+                y_parts.append(torch.from_numpy(y_np))
+
+            if not x_parts:
+                continue
+
+            x_batch = torch.cat(x_parts, dim=0)
+            y_batch = torch.cat(y_parts, dim=0).long()
+
+            perm_np = rng.permutation(int(y_batch.shape[0])).astype(np.int64, copy=False)
+            perm = torch.from_numpy(perm_np)
+            x_batch = x_batch.index_select(0, perm)
+            y_batch = y_batch.index_select(0, perm)
+
+            if self.pin_memory and torch.cuda.is_available():
+                x_batch = x_batch.pin_memory()
+                y_batch = y_batch.pin_memory()
+
+            yield x_batch, y_batch
+
+
 class EEGDataModuleCrossSubject:
     """
     LOSO datamodule for cross-subject domain adaptation.
@@ -131,6 +246,11 @@ class EEGDataModuleCrossSubject:
         self.config = config
         self.seed = int(config.get("random_seed", 2026))
         self.source_val_ratio = float(config.get("source_val_ratio", 0.2))
+        self.num_workers = int(config.get("num_workers", 0))
+        self.pin_memory = bool(config.get("pin_memory", torch.cuda.is_available()))
+        self.persistent_workers = bool(config.get("persistent_workers", self.num_workers > 0))
+        pf = config.get("prefetch_factor", None)
+        self.prefetch_factor = None if pf in (None, "", "None", "none", "null", "NULL") else int(pf)
 
         self.subject_file_map: Optional[Dict[str, str]] = None
         self.test_subject_id: Optional[int] = None
@@ -145,12 +265,30 @@ class EEGDataModuleCrossSubject:
         self.source_candidate_keys: List[str] = []
         self.source_train_class_counts: Optional[np.ndarray] = None
         self.source_selection_info: Dict[str, Any] = {}
+        self.source_train_dataset_map: Dict[str, NPZMemmapSubsetDataset] = {}
+        self.source_candidate_train_counts: Dict[str, int] = {}
+        self.train_steps_per_epoch: Optional[int] = None
+        self.train_subject_batch_size: Optional[int] = None
+        self.train_subjects_per_batch: Optional[int] = None
+        self.train_subject_batch_policy: Optional[str] = None
+        self.train_subject_sampling_keys: List[str] = []
 
         self._label_cache: Dict[str, np.ndarray] = {}
         self._external_source_scores: Dict[str, float] = {}
         self._external_manual_sources: List[str] = []
         self._forced_source_selection_mode: Optional[str] = None
         self.selection_manager = SelectionManager(seed=self.seed)
+
+    def _loader_common_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+        }
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = self.persistent_workers
+            if self.prefetch_factor is not None:
+                kwargs["prefetch_factor"] = self.prefetch_factor
+        return kwargs
 
     def prepare_data(
         self,
@@ -199,9 +337,12 @@ class EEGDataModuleCrossSubject:
 
         source_train_parts: List[Dataset] = []
         source_val_parts: List[Dataset] = []
+        self.source_train_dataset_map = {}
+        self.source_candidate_train_counts = {}
         n_class = int(self.config.get("n_class", 2))
         class_counts = np.zeros(n_class, dtype=np.int64)
-        for sub_key in self.source_subject_keys:
+        selected_set = set(self.source_subject_keys)
+        for sub_key in self.source_candidate_keys:
             n = self._subject_len(sub_key)
             all_idx = np.arange(n, dtype=np.int64)
             tr_idx, va_idx = self._split_indices_for_subject(
@@ -209,10 +350,16 @@ class EEGDataModuleCrossSubject:
                 all_idx,
                 test_size=self.source_val_ratio,
             )
-            source_train_parts.append(NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=tr_idx))
-            source_val_parts.append(NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=va_idx))
-            labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
-            class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
+            self.source_candidate_train_counts[sub_key] = int(tr_idx.shape[0])
+
+            if sub_key in selected_set:
+                train_ds = NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=tr_idx)
+                val_ds = NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=va_idx)
+                self.source_train_dataset_map[sub_key] = train_ds
+                source_train_parts.append(train_ds)
+                source_val_parts.append(val_ds)
+                labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
+                class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
 
         self.train_dataset = ConcatDataset(source_train_parts)
         self.val_dataset = ConcatDataset(source_val_parts)
@@ -244,8 +391,8 @@ class EEGDataModuleCrossSubject:
             self.target_unlabeled_dataset,
             batch_size=tb,
             shuffle=True,
-            num_workers=0,
             drop_last=False,
+            **self._loader_common_kwargs(),
         )
         return DualStreamDataLoader(source_loader, target_loader, cycle_target=True)
 
@@ -254,25 +401,116 @@ class EEGDataModuleCrossSubject:
         batch_size: int = 32,
         sampler=None,
         drop_last: bool = True,
-    ) -> DataLoader:
+    ):
         """Source-only supervised loader for baseline training."""
         assert self.train_dataset is not None, "Call setup() first."
+        assert self.source_train_dataset_map, "Call setup() first."
+
+        if bool(self.config.get("subject_batching", False)) and sampler is None:
+            return self._subject_batch_train_loader(fallback_batch_size=batch_size)
+
+        self.train_steps_per_epoch = None
+        self.train_subject_batch_size = int(batch_size)
+        self.train_subjects_per_batch = 1
+        self.train_subject_batch_policy = "flat_concat"
+        self.train_subject_sampling_keys = list(self.source_subject_keys)
         return DataLoader(
             self.train_dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=0,
             drop_last=drop_last,
+            **self._loader_common_kwargs(),
+        )
+
+    def _subject_batch_train_loader(self, fallback_batch_size: int):
+        subjects_per_batch_raw = self.config.get("subjects_per_batch", None)
+        if subjects_per_batch_raw in (None, "", "None", "none", "null", "NULL"):
+            subjects_per_batch = len(self.source_subject_keys)
+        else:
+            subjects_per_batch = int(subjects_per_batch_raw)
+        if subjects_per_batch <= 0:
+            raise ValueError("subjects_per_batch must be > 0.")
+
+        subject_batch_size_raw = self.config.get("subject_batch_size", None)
+        if subject_batch_size_raw in (None, "", "None", "none", "null", "NULL"):
+            per_subject_batch_size = int(fallback_batch_size)
+        else:
+            per_subject_batch_size = int(subject_batch_size_raw)
+        if per_subject_batch_size <= 0:
+            raise ValueError("subject_batch_size must be > 0.")
+
+        all_source_mode = str(self.source_selection_info.get("mode", "")).strip().lower() == "all"
+        all_source_policy = str(self.config.get("all_source_batch_policy", "random_k")).strip().lower()
+
+        if all_source_mode and all_source_policy == "random_k":
+            policy = "random_k_each_step"
+            random_subjects_each_step = True
+            subject_keys_for_sampling = list(self.source_subject_keys)
+        else:
+            policy = "fixed_k_subjects"
+            random_subjects_each_step = False
+            if len(self.source_subject_keys) < subjects_per_batch:
+                raise ValueError(
+                    f"Selected source subjects={len(self.source_subject_keys)} < subjects_per_batch={subjects_per_batch}."
+                )
+            subject_keys_for_sampling = list(self.source_subject_keys[:subjects_per_batch])
+
+        ref_mode = str(self.config.get("epoch_step_reference", "all_candidates")).strip().lower()
+        override_steps_raw = self.config.get("epoch_steps_override", None)
+        if override_steps_raw not in (None, "", "None", "none", "null", "NULL"):
+            steps_per_epoch = int(override_steps_raw)
+        else:
+            global_batch = subjects_per_batch * per_subject_batch_size
+            if global_batch <= 0:
+                raise ValueError("Global batch size must be > 0.")
+
+            if ref_mode in ("all_candidates", "all", "candidates"):
+                total_ref_samples = int(sum(self.source_candidate_train_counts.values()))
+            elif ref_mode in ("selected_sources", "selected", "pool"):
+                total_ref_samples = int(
+                    sum(len(self.source_train_dataset_map[k]) for k in subject_keys_for_sampling)
+                )
+            else:
+                raise ValueError(f"Unknown epoch_step_reference: {ref_mode}")
+
+            steps_per_epoch = int(np.ceil(float(total_ref_samples) / float(global_batch)))
+        steps_per_epoch = max(1, int(steps_per_epoch))
+
+        self.train_steps_per_epoch = steps_per_epoch
+        self.train_subject_batch_size = per_subject_batch_size
+        self.train_subjects_per_batch = subjects_per_batch
+        self.train_subject_batch_policy = policy
+        self.train_subject_sampling_keys = list(subject_keys_for_sampling)
+
+        return SubjectBatchDataLoader(
+            subject_datasets=self.source_train_dataset_map,
+            subject_keys_for_sampling=subject_keys_for_sampling,
+            subjects_per_batch=subjects_per_batch,
+            per_subject_batch_size=per_subject_batch_size,
+            steps_per_epoch=steps_per_epoch,
+            random_subjects_each_step=random_subjects_each_step,
+            seed=self.seed + int(self.test_subject_id or 0) * 1000,
+            pin_memory=self.pin_memory,
         )
 
     def val_dataloader(self, batch_size: int = 64) -> DataLoader:
         assert self.val_dataset is not None, "Call setup() first."
-        return DataLoader(self.val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            **self._loader_common_kwargs(),
+        )
 
     def test_dataloader(self, batch_size: int = 1000) -> DataLoader:
         assert self.test_dataset is not None, "Call setup() first."
-        return DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            **self._loader_common_kwargs(),
+        )
 
     def target_adaptation_dataloader(self, batch_size: int = 64) -> DataLoader:
         assert self.target_unlabeled_dataset is not None, "Call setup() first."
@@ -280,8 +518,8 @@ class EEGDataModuleCrossSubject:
             self.target_unlabeled_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
             drop_last=False,
+            **self._loader_common_kwargs(),
         )
 
     def _select_source_subjects(self, held_out_key: str, candidate_keys: List[str]) -> List[str]:

@@ -129,6 +129,7 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
         "fs",
         "n_class",
         "batch_size",
+        "subject_batch_size",
         "epochs",
         "patience",
         "early_stop_start_epoch",
@@ -181,6 +182,8 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
     _cast_if_present(merged_config, float_fields, float)
 
     optional_int_fields = [
+        "subjects_per_batch",
+        "epoch_steps_override",
         "rpt_aug_n_synth_per_batch",
         "source_selection_k",
         "rpcs_top_k",
@@ -217,6 +220,7 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
         "is_training",
         "use_gpu",
         "data_mix",
+        "subject_batching",
         "log_runtime",
         "class_weighted_ce",
         "use_target_stream",
