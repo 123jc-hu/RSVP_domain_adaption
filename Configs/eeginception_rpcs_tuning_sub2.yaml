@@ -1,0 +1,91 @@
+# EEGInception + R-PCS 单被试快速调参配置
+# 用途：只跑 held-out subject 2，快速淘汰明显不合适的 R-PCS 参数。
+# 结果汇总：summary_csv 会记录每次 trial 的具体参数和 subject 2 的测试指标。
+#
+# 运行方式：
+#   cd /home/cdd/RSVP/domain_adaption
+#   /home/cdd/miniconda3/envs/rsvp_pl/bin/python run_rpcs_tuning.py --config Configs/eeginception_rpcs_tuning_sub2.yaml
+
+model: EEGInception
+dataset: THU
+target_subject_id: 2
+summary_csv: Experiments/EEGInception/THU/cross-subject/rpcs_tuning_sub2_summary.csv
+
+base_overrides:
+  is_training: true
+  source_selection: R-PCS
+
+  held_out_start_id: 2
+  held_out_end_id: 2
+
+  subject_batch_size: 64
+  subjects_per_batch: 16
+
+  random_seed: 2026
+  epochs: 400
+  early_stop_start_epoch: 30
+  patience: 15
+
+  val_batch_size: 1024
+  minimal_log: true
+  debug_domain_batch: false
+  log_runtime: false
+
+  deterministic_run: true
+  cudnn_benchmark: false
+  matmul_precision: highest
+
+  rpcs_score_mode: rpcs
+  rpcs_mean_metric: riemann
+  rpcs_distance_metric: riemann
+  rpcs_max_trials_per_class: 128
+  rpcs_min_trials_per_class: 4
+  rpcs_cov_estimator: sample
+  rpcs_use_correlation: true
+  rpcs_target_use_all_trials: true
+  rpcs_target_bg_ratio: 0.7
+  rpcs_tau_d: null
+  rpcs_tau_s: null
+
+trials:
+  - id: amp_default
+    description: "默认门控 + amplitude 背景"
+    overrides:
+      rpcs_target_bg_mode: amplitude
+      rpcs_tau_d_percentile: 30.0
+      rpcs_tau_s_percentile: 70.0
+
+  - id: amp_loose
+    description: "宽松门控 + amplitude 背景"
+    overrides:
+      rpcs_target_bg_mode: amplitude
+      rpcs_tau_d_percentile: 20.0
+      rpcs_tau_s_percentile: 80.0
+
+  - id: amp_strict
+    description: "严格门控 + amplitude 背景"
+    overrides:
+      rpcs_target_bg_mode: amplitude
+      rpcs_tau_d_percentile: 40.0
+      rpcs_tau_s_percentile: 60.0
+
+  - id: all_default
+    description: "默认门控 + all 背景"
+    overrides:
+      rpcs_target_bg_mode: all
+      rpcs_tau_d_percentile: 30.0
+      rpcs_tau_s_percentile: 70.0
+
+  - id: all_loose
+    description: "宽松门控 + all 背景"
+    overrides:
+      rpcs_target_bg_mode: all
+      rpcs_tau_d_percentile: 20.0
+      rpcs_tau_s_percentile: 80.0
+
+  - id: all_strict
+    description: "严格门控 + all 背景"
+    overrides:
+      rpcs_target_bg_mode: all
+      rpcs_tau_d_percentile: 40.0
+      rpcs_tau_s_percentile: 60.0
