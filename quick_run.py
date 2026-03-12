@@ -19,11 +19,8 @@ def build_quick_config():
     cfg["source_selection"] = "Random"
     cfg["source_selection_k"] = 6
 
-    cfg["subject_batching"] = True
     cfg["subject_batch_size"] = 32
     cfg["subjects_per_batch"] = 6
-    cfg["epoch_step_reference"] = "all_candidates"
-    cfg["batch_size"] = 128
     cfg["num_workers"] = 8
     cfg["pin_memory"] = True
     cfg["persistent_workers"] = True

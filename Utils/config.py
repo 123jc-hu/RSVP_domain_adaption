@@ -32,15 +32,23 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(file)
 
 
-def set_random_seed(seed: int = 2026) -> None:
+def set_random_seed(
+    seed: int = 2026,
+    *,
+    deterministic: bool = True,
+    benchmark: bool = False,
+    matmul_precision: str = "highest",
+) -> None:
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    cudnn.benchmark = False
-    cudnn.deterministic = True
+    cudnn.benchmark = bool(benchmark)
+    cudnn.deterministic = bool(deterministic)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(str(matmul_precision))
 
 
 class Logger:
@@ -128,8 +136,8 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
         "n_channels",
         "fs",
         "n_class",
-        "batch_size",
         "subject_batch_size",
+        "val_batch_size",
         "epochs",
         "patience",
         "early_stop_start_epoch",
@@ -183,7 +191,7 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
 
     optional_int_fields = [
         "subjects_per_batch",
-        "epoch_steps_override",
+        "debug_domain_batch_max_steps",
         "rpt_aug_n_synth_per_batch",
         "source_selection_k",
         "rpcs_top_k",
@@ -219,9 +227,11 @@ def build_config(model_name: str, dataset_name: str = None) -> Dict[str, Any]:
     bool_fields = [
         "is_training",
         "use_gpu",
-        "data_mix",
-        "subject_batching",
         "log_runtime",
+        "minimal_log",
+        "debug_domain_batch",
+        "deterministic_run",
+        "cudnn_benchmark",
         "class_weighted_ce",
         "use_target_stream",
         "iahm_enable",

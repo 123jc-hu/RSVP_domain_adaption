@@ -17,6 +17,8 @@ def model_dict() -> Dict[str, Any]:
     """Supported backbone models (lazy-loaded)."""
     return {
         "DeepConvNet": _LazyBackbone("DeepConvNet"),
+        "EEGConformer": _LazyBackbone("EEGConformer"),
+        "EEGIncNet": _LazyBackbone("EEGIncNet"),
         "EEGNet": _LazyBackbone("EEGNet"),
         "PLNet": _LazyBackbone("PLNet"),
         "EEGInception": _LazyBackbone("EEGInception"),

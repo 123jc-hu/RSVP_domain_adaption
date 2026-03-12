@@ -1,0 +1,83 @@
+# Source Selection 调试手册（仅文档用途）
+# 该文件默认不会被训练代码自动读取。
+# 用法：按需把下面的键值复制到 Configs/config.yaml。
+
+meta:
+  project: RSVP_domain_adaption
+  purpose: Source Selection 可复现实验记录
+
+fixed_data_loading:
+  # 先固定这一组数据抽取参数，再只切换下面的 source selection 策略参数。
+  subject_batch_size: 32
+  subjects_per_batch: 32
+
+  # 常用推导量：
+  # global_train_batch = subject_batch_size * subjects_per_batch
+  # 当前默认：32 * 32 = 1024
+  # 注：epoch_step_reference 已在代码中硬锁为 per_subject_first，不再通过 config 配置。
+  # steps_per_epoch（当前实现）= floor(参考subject的train样本数 / subject_batch_size)
+  # 等价于 drop_last=True，尾部不足一个 b 的样本直接丢弃。
+
+experiment_profiles:
+  all_source_random_k:
+    description: "All-Source：源域被试池为全部 N 个；每个 step 随机抽 K 个被试。"
+    set:
+      source_selection: All
+      source_selection_k: null
+      all_source_batch_policy: random_k
+    expected_behavior:
+      train_subject_pool: "训练被试池：全部 N 个 source subjects"
+      train_step_sampling: "每个 step：随机抽 K 个被试；被抽中的被试各自取本 epoch 的下一个 batch（被试内无放回）"
+      val_subject_pool: "验证被试池：全部 N 个 source subjects"
+
+  random_k_fixed_pool:
+    description: "Random-K：每个 fold 先随机选定固定 K 个 source，被试池不再变化。"
+    set:
+      source_selection: Random
+      source_selection_k: null   # null 时自动回退为 subjects_per_batch
+      all_source_batch_policy: fixed_k
+    expected_behavior:
+      train_subject_pool: "训练被试池：固定随机 K 个被试"
+      train_step_sampling: "每个 step：从这 K 个被试各取一个 batch；每个 epoch 内按被试内无放回顺序取样"
+      val_subject_pool: "验证被试池：同一组固定 K 个被试"
+
+  rpcs_fixed_k:
+    description: "R-PCS：每个 fold 按 R-PCS 打分选固定 K 个 source。"
+    set:
+      source_selection: R-PCS
+      rpcs_top_k: null   # null 时自动回退为 subjects_per_batch
+      all_source_batch_policy: fixed_k
+      # 可选：按阈值进一步过滤（默认不启用）
+      source_selection_min_score: null
+    expected_behavior:
+      train_subject_pool: "训练被试池：R-PCS 选出的固定 Top-K 被试"
+      train_step_sampling: "每个 step：从选中的 K 个被试各取一个 batch；每个 epoch 内按被试内无放回顺序取样"
+      val_subject_pool: "验证被试池：同一组选中的 K 个被试"
+
+fair_comparison_rules:
+  keep_constant:
+    - subject_batch_size
+    - subjects_per_batch
+    - epochs
+    - optimizer 与 scheduler 相关设置
+  note:
+    - "为公平比较，Random-K 与 R-PCS 的 K 应保持一致。"
+    - "当前逻辑下，All-Source 训练时每 step 随机 K，但验证仍使用全部 N 个 source。"
+    - "K 改变时训练时长基本不变，因 epoch_step_reference 已硬锁为 per_subject_first。"
+
+quick_debug_profile:
+  description: "全量实验前的快速冒烟配置。"
+  optional_override:
+    n_fold: 2
+    epochs: 3
+    early_stop_start_epoch: 1
+    patience: 2
+    num_workers: 4
+    log_runtime: false
+
+run_notes:
+  working_dir: "/home/cdd/RSVP/domain_adaption"
+  command: "python main.py"
+  checks:
+    - "日志应打印 subject_batch_policy / subjects_per_batch / subject_batch_size。"
+    - "检查每个 subject 的 source selection 日志，确认策略行为符合预期。"

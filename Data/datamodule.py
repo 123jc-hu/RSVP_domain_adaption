@@ -79,6 +79,28 @@ class UnlabeledViewDataset(Dataset):
         return item[0]
 
 
+class SubjectLabeledConcatDataset(ConcatDataset):
+    """ConcatDataset that also returns the real source subject id as domain_id."""
+
+    def __init__(self, datasets: List[Dataset], subject_keys: List[str]):
+        super().__init__(datasets)
+        if len(datasets) != len(subject_keys):
+            raise ValueError("datasets and subject_keys must have the same length.")
+        self.index_to_domain_id: Dict[int, int] = {}
+        start = 0
+        for ds, skey in zip(datasets, subject_keys):
+            end = start + len(ds)
+            domain_id = int(normalize_subject_key(skey)[3:])
+            for idx in range(start, end):
+                self.index_to_domain_id[idx] = domain_id
+            start = end
+
+    def __getitem__(self, index):
+        x, y = super().__getitem__(index)
+        domain_id = self.index_to_domain_id[int(index)]
+        return x, y, torch.tensor(domain_id).long()
+
+
 class DualStreamDataLoader:
     """
     Yield domain-adaptation batches:
@@ -99,12 +121,13 @@ class DualStreamDataLoader:
     def __len__(self):
         return len(self.source_loader)
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, ...]]:
         target_iter = iter(self.target_loader)
         for src_batch in self.source_loader:
             if not isinstance(src_batch, (tuple, list)) or len(src_batch) < 2:
                 raise ValueError("Source batch must be (source_x, source_y, ...).")
             source_x, source_y = src_batch[0], src_batch[1]
+            source_domain_id = src_batch[2] if len(src_batch) >= 3 else None
 
             try:
                 tgt_batch = next(target_iter)
@@ -115,7 +138,10 @@ class DualStreamDataLoader:
                 tgt_batch = next(target_iter)
 
             target_x = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
-            yield source_x, source_y, target_x
+            if source_domain_id is not None:
+                yield source_x, source_y, target_x, source_domain_id
+            else:
+                yield source_x, source_y, target_x
 
 
 class SubjectBatchDataLoader:
@@ -123,8 +149,9 @@ class SubjectBatchDataLoader:
     Subject-aware batch loader.
 
     One step yields:
+    - each subject maintains its own shuffled batch queue for the current epoch
     - choose subject keys (fixed K keys OR random K keys each step)
-    - sample `per_subject_batch_size` trials from each subject
+    - pop the next per-subject batch from every chosen subject
     - concatenate into global batch of size `subjects_per_batch * per_subject_batch_size`
     """
 
@@ -153,6 +180,8 @@ class SubjectBatchDataLoader:
 
         self.subject_datasets = dict(subject_datasets)
         self.subject_keys_for_sampling = list(subject_keys_for_sampling)
+        self.subject_sizes = {k: int(len(v)) for k, v in self.subject_datasets.items()}
+        self.subject_domain_ids = {k: int(normalize_subject_key(k)[3:]) for k in self.subject_datasets.keys()}
         self.subjects_per_batch = int(subjects_per_batch)
         self.per_subject_batch_size = int(per_subject_batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
@@ -190,46 +219,193 @@ class SubjectBatchDataLoader:
             return [self.subject_keys_for_sampling[int(i)] for i in idx]
         return list(self.subject_keys_for_sampling[: self.subjects_per_batch])
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def _build_epoch_queues(self, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        queues: Dict[str, np.ndarray] = {}
+        for skey in self.subject_keys_for_sampling:
+            ds = self.subject_datasets[skey]
+            idx = np.asarray(ds.indices, dtype=np.int64)
+            full_batches = int(idx.size // self.per_subject_batch_size)
+            if full_batches <= 0:
+                queues[skey] = np.empty((0, self.per_subject_batch_size), dtype=np.int64)
+                continue
+            usable = rng.permutation(idx)[: full_batches * self.per_subject_batch_size]
+            queues[skey] = np.asarray(usable, dtype=np.int64).reshape(full_batches, self.per_subject_batch_size)
+        return queues
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         rng = np.random.default_rng(self.seed + self._epoch)
         self._epoch += 1
+        subject_queues = self._build_epoch_queues(rng)
+        subject_queue_ptrs = {k: 0 for k in self.subject_keys_for_sampling}
 
         for _ in range(self.steps_per_epoch):
-            chosen_subjects = self._pick_subjects(rng)
-            x_parts: List[torch.Tensor] = []
-            y_parts: List[torch.Tensor] = []
+            available_subjects = [
+                skey
+                for skey in self.subject_keys_for_sampling
+                if subject_queue_ptrs[skey] < int(subject_queues[skey].shape[0])
+            ]
+            if len(available_subjects) < self.subjects_per_batch:
+                break
+
+            if self.random_subjects_each_step:
+                idx = rng.choice(len(available_subjects), size=self.subjects_per_batch, replace=False)
+                chosen_subjects = [available_subjects[int(i)] for i in idx]
+            else:
+                chosen_subjects = list(available_subjects[: self.subjects_per_batch])
+
+            x_parts: List[np.ndarray] = []
+            y_parts: List[np.ndarray] = []
+            d_parts: List[np.ndarray] = []
 
             for skey in chosen_subjects:
                 ds = self.subject_datasets[skey]
-                n = len(ds)
-                if n <= 0:
-                    continue
-
-                local_idx = rng.integers(0, n, size=self.per_subject_batch_size, endpoint=False)
-                real_idx = ds.indices[local_idx]
-
+                queue_ptr = subject_queue_ptrs[skey]
+                real_idx = subject_queues[skey][queue_ptr]
+                subject_queue_ptrs[skey] = queue_ptr + 1
                 x_np = np.asarray(ds.x_data[real_idx], dtype=np.float32)
                 y_np = np.asarray(ds.y_data[real_idx], dtype=np.int64)
+                d_np = np.full((x_np.shape[0],), self.subject_domain_ids[skey], dtype=np.int64)
 
-                x_parts.append(torch.from_numpy(x_np))
-                y_parts.append(torch.from_numpy(y_np))
+                x_parts.append(x_np)
+                y_parts.append(y_np)
+                d_parts.append(d_np)
 
             if not x_parts:
                 continue
 
-            x_batch = torch.cat(x_parts, dim=0)
-            y_batch = torch.cat(y_parts, dim=0).long()
+            x_batch_np = np.concatenate(x_parts, axis=0)
+            y_batch_np = np.concatenate(y_parts, axis=0).astype(np.int64, copy=False)
+            d_batch_np = np.concatenate(d_parts, axis=0).astype(np.int64, copy=False)
+            perm_np = rng.permutation(int(y_batch_np.shape[0])).astype(np.int64, copy=False)
+            x_batch_np = np.ascontiguousarray(x_batch_np[perm_np], dtype=np.float32)
+            y_batch_np = np.ascontiguousarray(y_batch_np[perm_np], dtype=np.int64)
+            d_batch_np = np.ascontiguousarray(d_batch_np[perm_np], dtype=np.int64)
 
-            perm_np = rng.permutation(int(y_batch.shape[0])).astype(np.int64, copy=False)
-            perm = torch.from_numpy(perm_np)
-            x_batch = x_batch.index_select(0, perm)
-            y_batch = y_batch.index_select(0, perm)
+            x_batch = torch.from_numpy(x_batch_np)
+            y_batch = torch.from_numpy(y_batch_np).long()
+            d_batch = torch.from_numpy(d_batch_np).long()
 
             if self.pin_memory and torch.cuda.is_available():
                 x_batch = x_batch.pin_memory()
                 y_batch = y_batch.pin_memory()
+                d_batch = d_batch.pin_memory()
 
-            yield x_batch, y_batch
+            yield x_batch, y_batch, d_batch
+
+
+class FixedSubjectBatchDataLoader:
+    """
+    Subject-aware loader for fixed-K source pools.
+
+    One epoch:
+    - keep the selected K subject keys fixed
+    - shuffle each subject's sample index queue once
+    - each step takes the next `per_subject_batch_size` samples from every subject
+    - samples are used at most once per epoch for each subject
+    """
+
+    def __init__(
+        self,
+        *,
+        subject_datasets: Dict[str, NPZMemmapSubsetDataset],
+        subject_keys_for_sampling: List[str],
+        subjects_per_batch: int,
+        per_subject_batch_size: int,
+        steps_per_epoch: int,
+        seed: int = 2026,
+        pin_memory: bool = False,
+    ):
+        if not subject_datasets:
+            raise ValueError("subject_datasets must be non-empty.")
+        if not subject_keys_for_sampling:
+            raise ValueError("subject_keys_for_sampling must be non-empty.")
+        if subjects_per_batch <= 0:
+            raise ValueError("subjects_per_batch must be > 0.")
+        if per_subject_batch_size <= 0:
+            raise ValueError("per_subject_batch_size must be > 0.")
+        if steps_per_epoch <= 0:
+            raise ValueError("steps_per_epoch must be > 0.")
+        if subjects_per_batch > len(subject_keys_for_sampling):
+            raise ValueError(
+                f"subjects_per_batch={subjects_per_batch} requires at least that many fixed subject keys."
+            )
+
+        self.subject_datasets = dict(subject_datasets)
+        self.subject_keys_for_sampling = list(subject_keys_for_sampling[:subjects_per_batch])
+        self.subject_sizes = {k: int(len(v)) for k, v in self.subject_datasets.items()}
+        self.subject_domain_ids = {k: int(normalize_subject_key(k)[3:]) for k in self.subject_datasets.keys()}
+        self.subjects_per_batch = int(subjects_per_batch)
+        self.per_subject_batch_size = int(per_subject_batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.seed = int(seed)
+        self.pin_memory = bool(pin_memory)
+        self._epoch = 0
+
+        self.batch_size = self.subjects_per_batch * self.per_subject_batch_size
+        self.dataset = subject_datasets
+        self.drop_last = False
+        self.num_workers = 0
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def _build_epoch_queues(self, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+        queues: Dict[str, np.ndarray] = {}
+        for skey in self.subject_keys_for_sampling:
+            ds = self.subject_datasets[skey]
+            idx = np.asarray(ds.indices, dtype=np.int64)
+            if idx.size == 0:
+                queues[skey] = idx
+                continue
+            queues[skey] = rng.permutation(idx)
+        return queues
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1
+        subject_queues = self._build_epoch_queues(rng)
+
+        for step_idx in range(self.steps_per_epoch):
+            start = step_idx * self.per_subject_batch_size
+            end = start + self.per_subject_batch_size
+            x_parts: List[np.ndarray] = []
+            y_parts: List[np.ndarray] = []
+            d_parts: List[np.ndarray] = []
+
+            for skey in self.subject_keys_for_sampling:
+                real_idx = subject_queues[skey][start:end]
+                if real_idx.size == 0:
+                    continue
+
+                ds = self.subject_datasets[skey]
+                x_np = np.asarray(ds.x_data[real_idx], dtype=np.float32)
+                y_np = np.asarray(ds.y_data[real_idx], dtype=np.int64)
+                d_np = np.full((x_np.shape[0],), self.subject_domain_ids[skey], dtype=np.int64)
+                x_parts.append(x_np)
+                y_parts.append(y_np)
+                d_parts.append(d_np)
+
+            if not x_parts:
+                continue
+
+            x_batch_np = np.concatenate(x_parts, axis=0)
+            y_batch_np = np.concatenate(y_parts, axis=0).astype(np.int64, copy=False)
+            d_batch_np = np.concatenate(d_parts, axis=0).astype(np.int64, copy=False)
+            perm_np = rng.permutation(int(y_batch_np.shape[0])).astype(np.int64, copy=False)
+            x_batch_np = np.ascontiguousarray(x_batch_np[perm_np], dtype=np.float32)
+            y_batch_np = np.ascontiguousarray(y_batch_np[perm_np], dtype=np.int64)
+            d_batch_np = np.ascontiguousarray(d_batch_np[perm_np], dtype=np.int64)
+
+            x_batch = torch.from_numpy(x_batch_np)
+            y_batch = torch.from_numpy(y_batch_np).long()
+            d_batch = torch.from_numpy(d_batch_np).long()
+
+            if self.pin_memory and torch.cuda.is_available():
+                x_batch = x_batch.pin_memory()
+                y_batch = y_batch.pin_memory()
+                d_batch = d_batch.pin_memory()
+
+            yield x_batch, y_batch, d_batch
 
 
 class EEGDataModuleCrossSubject:
@@ -272,6 +448,9 @@ class EEGDataModuleCrossSubject:
         self.train_subjects_per_batch: Optional[int] = None
         self.train_subject_batch_policy: Optional[str] = None
         self.train_subject_sampling_keys: List[str] = []
+        self.train_step_reference_mode: Optional[str] = None
+        self.train_step_reference_subject: Optional[str] = None
+        self.train_step_reference_samples: Optional[int] = None
 
         self._label_cache: Dict[str, np.ndarray] = {}
         self._external_source_scores: Dict[str, float] = {}
@@ -361,7 +540,7 @@ class EEGDataModuleCrossSubject:
                 labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
                 class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
 
-        self.train_dataset = ConcatDataset(source_train_parts)
+        self.train_dataset = SubjectLabeledConcatDataset(source_train_parts, self.source_subject_keys)
         self.val_dataset = ConcatDataset(source_val_parts)
         self.source_train_class_counts = class_counts
 
@@ -373,7 +552,6 @@ class EEGDataModuleCrossSubject:
 
     def train_dataloader(
         self,
-        batch_size: int = 32,
         sampler=None,
         target_batch_size: Optional[int] = None,
         drop_last: bool = True,
@@ -382,11 +560,10 @@ class EEGDataModuleCrossSubject:
         assert self.target_unlabeled_dataset is not None, "Call setup() first."
 
         source_loader = self.source_train_dataloader(
-            batch_size=batch_size,
             sampler=sampler,
             drop_last=drop_last,
         )
-        tb = int(target_batch_size) if target_batch_size is not None else int(batch_size)
+        tb = int(target_batch_size) if target_batch_size is not None else int(self.config["subject_batch_size"])
         target_loader = DataLoader(
             self.target_unlabeled_dataset,
             batch_size=tb,
@@ -398,7 +575,6 @@ class EEGDataModuleCrossSubject:
 
     def source_train_dataloader(
         self,
-        batch_size: int = 32,
         sampler=None,
         drop_last: bool = True,
     ):
@@ -406,24 +582,11 @@ class EEGDataModuleCrossSubject:
         assert self.train_dataset is not None, "Call setup() first."
         assert self.source_train_dataset_map, "Call setup() first."
 
-        if bool(self.config.get("subject_batching", False)) and sampler is None:
-            return self._subject_batch_train_loader(fallback_batch_size=batch_size)
+        if sampler is not None:
+            raise ValueError("Custom sampler is not supported in the fixed subject-batching training path.")
+        return self._subject_batch_train_loader()
 
-        self.train_steps_per_epoch = None
-        self.train_subject_batch_size = int(batch_size)
-        self.train_subjects_per_batch = 1
-        self.train_subject_batch_policy = "flat_concat"
-        self.train_subject_sampling_keys = list(self.source_subject_keys)
-        return DataLoader(
-            self.train_dataset,
-            batch_size=batch_size,
-            shuffle=(sampler is None),
-            sampler=sampler,
-            drop_last=drop_last,
-            **self._loader_common_kwargs(),
-        )
-
-    def _subject_batch_train_loader(self, fallback_batch_size: int):
+    def _subject_batch_train_loader(self):
         subjects_per_batch_raw = self.config.get("subjects_per_batch", None)
         if subjects_per_batch_raw in (None, "", "None", "none", "null", "NULL"):
             subjects_per_batch = len(self.source_subject_keys)
@@ -433,10 +596,7 @@ class EEGDataModuleCrossSubject:
             raise ValueError("subjects_per_batch must be > 0.")
 
         subject_batch_size_raw = self.config.get("subject_batch_size", None)
-        if subject_batch_size_raw in (None, "", "None", "none", "null", "NULL"):
-            per_subject_batch_size = int(fallback_batch_size)
-        else:
-            per_subject_batch_size = int(subject_batch_size_raw)
+        per_subject_batch_size = int(subject_batch_size_raw)
         if per_subject_batch_size <= 0:
             raise ValueError("subject_batch_size must be > 0.")
 
@@ -448,7 +608,7 @@ class EEGDataModuleCrossSubject:
             random_subjects_each_step = True
             subject_keys_for_sampling = list(self.source_subject_keys)
         else:
-            policy = "fixed_k_subjects"
+            policy = "fixed_k_subjects_no_replacement"
             random_subjects_each_step = False
             if len(self.source_subject_keys) < subjects_per_batch:
                 raise ValueError(
@@ -456,25 +616,14 @@ class EEGDataModuleCrossSubject:
                 )
             subject_keys_for_sampling = list(self.source_subject_keys[:subjects_per_batch])
 
-        ref_mode = str(self.config.get("epoch_step_reference", "all_candidates")).strip().lower()
-        override_steps_raw = self.config.get("epoch_steps_override", None)
-        if override_steps_raw not in (None, "", "None", "none", "null", "NULL"):
-            steps_per_epoch = int(override_steps_raw)
-        else:
-            global_batch = subjects_per_batch * per_subject_batch_size
-            if global_batch <= 0:
-                raise ValueError("Global batch size must be > 0.")
-
-            if ref_mode in ("all_candidates", "all", "candidates"):
-                total_ref_samples = int(sum(self.source_candidate_train_counts.values()))
-            elif ref_mode in ("selected_sources", "selected", "pool"):
-                total_ref_samples = int(
-                    sum(len(self.source_train_dataset_map[k]) for k in subject_keys_for_sampling)
-                )
-            else:
-                raise ValueError(f"Unknown epoch_step_reference: {ref_mode}")
-
-            steps_per_epoch = int(np.ceil(float(total_ref_samples) / float(global_batch)))
+        ref_subject: Optional[str] = None
+        ref_samples: Optional[int] = None
+        ref_mode_effective = "per_subject_first"
+        if not subject_keys_for_sampling:
+            raise ValueError("subject_keys_for_sampling is empty when computing per-subject step budget.")
+        ref_subject = str(subject_keys_for_sampling[0])
+        ref_samples = int(len(self.source_train_dataset_map[ref_subject]))
+        steps_per_epoch = int(ref_samples // per_subject_batch_size)
         steps_per_epoch = max(1, int(steps_per_epoch))
 
         self.train_steps_per_epoch = steps_per_epoch
@@ -482,15 +631,29 @@ class EEGDataModuleCrossSubject:
         self.train_subjects_per_batch = subjects_per_batch
         self.train_subject_batch_policy = policy
         self.train_subject_sampling_keys = list(subject_keys_for_sampling)
+        self.train_step_reference_mode = ref_mode_effective
+        self.train_step_reference_subject = ref_subject
+        self.train_step_reference_samples = ref_samples
 
-        return SubjectBatchDataLoader(
+        loader_seed = self.seed + int(self.test_subject_id or 0) * 1000
+        if random_subjects_each_step:
+            return SubjectBatchDataLoader(
+                subject_datasets=self.source_train_dataset_map,
+                subject_keys_for_sampling=subject_keys_for_sampling,
+                subjects_per_batch=subjects_per_batch,
+                per_subject_batch_size=per_subject_batch_size,
+                steps_per_epoch=steps_per_epoch,
+                random_subjects_each_step=True,
+                seed=loader_seed,
+                pin_memory=self.pin_memory,
+            )
+        return FixedSubjectBatchDataLoader(
             subject_datasets=self.source_train_dataset_map,
             subject_keys_for_sampling=subject_keys_for_sampling,
             subjects_per_batch=subjects_per_batch,
             per_subject_batch_size=per_subject_batch_size,
             steps_per_epoch=steps_per_epoch,
-            random_subjects_each_step=random_subjects_each_step,
-            seed=self.seed + int(self.test_subject_id or 0) * 1000,
+            seed=loader_seed,
             pin_memory=self.pin_memory,
         )
 
@@ -523,6 +686,9 @@ class EEGDataModuleCrossSubject:
         )
 
     def _select_source_subjects(self, held_out_key: str, candidate_keys: List[str]) -> List[str]:
+        def _none_like(v: Any) -> bool:
+            return v in (None, "", "None", "none", "null", "NULL")
+
         mode = self._forced_source_selection_mode
         if not mode:
             mode = str(self.config.get("source_selection_mode", "")).strip().lower()
@@ -544,23 +710,27 @@ class EEGDataModuleCrossSubject:
             }
             mode = strategy_map.get(strategy, "all")
 
+        mode_norm = str(mode).strip().lower().replace("-", "_")
+
         k_val = self.config.get("source_selection_k", None)
-        if k_val in (None, "", "None", "none", "null", "NULL"):
+        if _none_like(k_val):
             k_val = self.config.get("rpcs_top_k", None)
-        if k_val in (None, "", "None", "none", "null", "NULL"):
+        if _none_like(k_val):
             k_val = self.config.get("pccs_top_k", None)
         min_score_val = self.config.get("source_selection_min_score", None)
-        k = None if k_val in (None, "", "None", "none", "null", "NULL") else int(k_val)
-        min_score = None if min_score_val in (None, "", "None", "none", "null", "NULL") else float(min_score_val)
+        k = None if _none_like(k_val) else int(k_val)
+        min_score = None if _none_like(min_score_val) else float(min_score_val)
+
+        # Convenience fallback:
+        # - Random-K with source_selection_k unset -> default to subjects_per_batch.
+        # - R-PCS / PCCS with top-k unset -> default to subjects_per_batch.
+        if mode_norm in {"random_k", "random", "rand_k", "scores"} and (k is None or int(k) <= 0):
+            sb = self.config.get("subjects_per_batch", None)
+            if not _none_like(sb):
+                k = int(sb)
 
         manual_sources = self._external_manual_sources
-        if not manual_sources:
-            manual_sources = normalize_subject_list(self.config.get("source_selection_subjects", []))
-
         source_scores = self._external_source_scores
-        if not source_scores:
-            cfg_scores = self.config.get("source_selection_scores", {})
-            source_scores = normalize_score_map(cfg_scores if isinstance(cfg_scores, dict) else {})
 
         selected = self.selection_manager.select(
             candidate_subjects=candidate_keys,
@@ -577,6 +747,7 @@ class EEGDataModuleCrossSubject:
             "mode": mode,
             "k": k,
             "min_score": min_score,
+            "selection_seed": int(self.seed) + int(normalize_subject_key(held_out_key)[3:]),
             "num_candidates": len(candidate_keys),
             "num_selected": len(selected),
             "selected_subjects": list(selected),

@@ -1,43 +1,57 @@
-model: EEGNet
-is_training: true
-random_seed: 2026
+model: EEGInception
 dataset: THU
-n_fold: null
-epochs: 400
-weight_decay: 0.0001
-patience: 20
-early_stop_start_epoch: 50
-use_gpu: true
 train_mode: cross-subject
-data_mix: true
-class_weighted_ce: true
-use_target_stream: false
+is_training: true
+use_gpu: true
+random_seed: 2026
+n_fold: null
+deterministic_run: true
+cudnn_benchmark: false
+matmul_precision: highest  # highest | high | medium
 dataset_root: /home/cdd/datasets/learning_projects/few-shot-learning_RSVP/Dataset
+
+# Training schedule & optimization
+epochs: 400
+val_batch_size: 1024  # Larger validation batch for faster val pass
+weight_decay: 0.0001
+patience: 15
+early_stop_start_epoch: 30
+cosine_eta_min_factor: 0.01
+class_weighted_ce: true
+
+# Runtime profiling
+log_runtime: true
+rt_deadline_ms: 200.0
+minimal_log: true   # true: keep logs compact (start settings + per-subject test + dataset average)
+debug_domain_batch: false  # true: print domain composition for the first few training steps
+debug_domain_batch_max_steps: 3
+
+# Source selection policy
+source_selection: All      # Options: All | Random | R-PCS | SimilarityOnly | DiscrimOnly (PCCS alias)
+source_selection_k: null
+source_selection_min_score: null
+
 # Subject-wise training batch policy (fair K-subject comparison)
 # global_train_batch = subjects_per_batch * subject_batch_size
-subject_batching: true
-subject_batch_size: 32        # b: samples per selected subject in one training step
-subjects_per_batch: 32         # K: number of source subjects sampled per training step
+subject_batch_size: 64      # b: samples per selected subject in one training step
+subjects_per_batch: 16      # K: number of source subjects sampled per training step
 all_source_batch_policy: random_k  # All-Source mode: random_k (random K each step) | fixed_k
-epoch_step_reference: all_candidates  # all_candidates | selected_sources
-epoch_steps_override: null    # set int to force fixed steps/epoch, null means auto-compute
+
+# DA framework switches (scaffold stage)
+use_target_stream: false
+embedding_space: Euclidean  # Options: Hyperbolic | Euclidean
+psi_method: None            # Options: Tangent_Space | Time_Domain | None
+training_mode: End2End      # Options: Decoupled | End2End
+lambda_align: 0.0
+alignment_loss: mmd         # currently supports: mmd
+logit_adjustment: false
+pseudo_refinement: false
 
 # DataLoader I/O tuning (especially useful when dataset is on NTFS mount)
 num_workers: 4
 pin_memory: true
 persistent_workers: true
 prefetch_factor: 2
-cosine_eta_min_factor: 0.01
-
-# HyR-DPA framework switches (scaffold stage)
-source_selection: All      # Options: All | Random | R-PCS | SimilarityOnly | DiscrimOnly (PCCS alias)
-embedding_space: Euclidean # Options: Hyperbolic | Euclidean
-psi_method: None           # Options: Tangent_Space | Time_Domain | None
-training_mode: End2End     # Options: Decoupled | End2End
-logit_adjustment: false
-pseudo_refinement: false
-lambda_align: 0.0
-alignment_loss: mmd        # currently supports: mmd
 
 # IAHM controls (imbalance-aware hyperbolic metric loss)
 iahm_enable: false
@@ -65,18 +79,12 @@ rpt_aug_use_correlation: true
 rpt_aug_correlation_eps: 1.0e-12
 rpt_aug_input_layout: channel_first # channel_first | time_first | auto
 
-# Source selection controls
-source_selection_k: null
-source_selection_min_score: null
-source_selection_subjects: []
-source_selection_scores: {}
-
 # R-PCS controls (preferred) + PCCS legacy aliases
 rpcs_positive_label: 1
 rpcs_background_label: 0
 rpcs_max_trials_per_class: 128
 rpcs_min_trials_per_class: 4
-rpcs_top_k: null
+rpcs_top_k: null             # null 时默认回退为 subjects_per_batch
 rpcs_mean_metric: riemann
 rpcs_distance_metric: riemann
 rpcs_mean_max_iter: 20
@@ -129,70 +137,68 @@ pccs_tau_s: null
 pccs_tau_d_percentile: 30.0
 pccs_tau_s_percentile: 70.0
 
-log_runtime: true
-rt_deadline_ms: 200.0
-
 datasets:
   THU:
     sub_num: 64
     n_channels: 62
     fs: 128
     n_class: 2
-    batch_size: 32
   CAS:
     sub_num: 14
     n_channels: 62
     fs: 128
     n_class: 2
-    batch_size: 32
   GIST:
     sub_num: 55
     n_channels: 32
     fs: 128
     n_class: 2
-    batch_size: 32
   TCTR_1:
     sub_num: 15
     n_channels: 64
     fs: 128
     n_class: 2
-    batch_size: 32
   TCTR_2:
     sub_num: 15
     n_channels: 64
     fs: 128
     n_class: 2
-    batch_size: 32
   TCTR_A:
     sub_num: 15
     n_channels: 64
     fs: 128
     n_class: 2
-    batch_size: 32
   TCTR_B:
     sub_num: 15
     n_channels: 64
     fs: 128
     n_class: 2
-    batch_size: 32
 
 models:
   DeepConvNet:
     learning_rate: 0.00005
-    cosine_t_max: 400
+    cosine_t_max: 150
 
   EEGNet:
     learning_rate: 0.001
-    cosine_t_max: 400
+    cosine_t_max: 150
 
   PLNet:
     learning_rate: 0.001
-    cosine_t_max: 400
+    cosine_t_max: 150
 
   EEGInception:
-    learning_rate: 0.0001
-    cosine_t_max: 400
+    learning_rate: 0.001
+    cosine_t_max: 150
+
+  EEGConformer:
+    learning_rate: 0.00005
+    cosine_t_max: 150
+
+  EEGIncNet:
+    learning_rate: 0.001
+    cosine_t_max: 150
 
   PPNN:
     learning_rate: 0.0001
-    cosine_t_max: 400
+    cosine_t_max: 150

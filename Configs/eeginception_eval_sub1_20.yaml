@@ -1,0 +1,35 @@
+# EEGInception 仅测试配置
+# 用途：加载已训练好的 checkpoint，对前 20 个 held-out target 重新做测试汇总。
+# 说明：
+# - 不进行训练，直接读取 Experiments/EEGInception/THU/cross-subject/checkpoints/sub*/best_ba_model--2.pth
+# - 训练时采用的 source 策略是 All-Source + random_k，这里保留同名配置便于语义对应
+# - 真正影响测试指标的是 held-out 范围、模型名、数据集名以及对应 checkpoint 是否存在
+
+model: EEGInception
+dataset: THU
+
+overrides:
+  is_training: false
+
+  source_selection: All
+  source_selection_k: null
+  all_source_batch_policy: random_k
+
+  held_out_start_id: 1
+  held_out_end_id: 20
+
+  subject_batch_size: 64
+  subjects_per_batch: 16
+
+  val_batch_size: 1024
+  test_batch_size: 1000
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  minimal_log: true
+  debug_domain_batch: false
+  log_runtime: false
+
+  deterministic_run: true
+  cudnn_benchmark: false
+  matmul_precision: highest

@@ -1,0 +1,33 @@
+# EEGIncNet 单模型运行配置
+# 用途：只跑 EEGIncNet，并将前 20 个 subject 依次作为 held-out target。
+#
+# 运行方式：
+#   cd /home/cdd/RSVP/domain_adaption
+#   /home/cdd/miniconda3/envs/rsvp_pl/bin/python run_model_config.py --config Configs/eegincnet_sub1_20.yaml
+
+model: EEGIncNet
+dataset: THU
+
+overrides:
+  source_selection: All
+  source_selection_k: null
+  all_source_batch_policy: random_k
+
+  held_out_start_id: 1
+  held_out_end_id: 20
+
+  subject_batch_size: 64
+  subjects_per_batch: 16
+
+  epochs: 400
+  early_stop_start_epoch: 30
+  patience: 15
+
+  val_batch_size: 1024
+  minimal_log: true
+  debug_domain_batch: false
+  log_runtime: false
+
+  deterministic_run: true
+  cudnn_benchmark: false
+  matmul_precision: highest

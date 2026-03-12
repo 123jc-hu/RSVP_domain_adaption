@@ -12,7 +12,6 @@ from typing import Callable, Dict, Tuple, List, Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -58,6 +57,7 @@ class OptimizedExperimentRunner:
     def __init__(self, config: Dict[str, Any], main_logger: logging.Logger):
         self.config = config
         self.log = main_logger
+        self.minimal_log = bool(config.get("minimal_log", True))
         use_gpu = bool(config.get("use_gpu", True))
         self.device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
         self.exp_dir = self._setup_exp_dir()
@@ -70,9 +70,16 @@ class OptimizedExperimentRunner:
         self.rpcs_ranking_records: List[Dict[str, Any]] = []
         self.rpcs_fold_records: List[Dict[str, Any]] = []
 
+    def _log_detail(self, msg: str):
+        if not self.minimal_log:
+            self.log.info(msg)
+
     def _setup_exp_dir(self) -> Path:
-        """Create `Experiments/<model>/<dataset>/<train_mode>` directory."""
+        """Create `Experiments/<model>/<dataset>/<train_mode>[/<exp_tag>]` directory."""
         root = Path("Experiments") / self.config["model"] / self.config["dataset"] / self.config["train_mode"]
+        exp_tag = str(self.config.get("exp_tag", "") or "").strip()
+        if exp_tag:
+            root = root / exp_tag
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -149,7 +156,12 @@ class OptimizedExperimentRunner:
 
     def run_experiment(self):
         """Run LOSO over all subjects in the selected dataset."""
-        set_random_seed(int(self.config.get("random_seed", 2026)))
+        set_random_seed(
+            int(self.config.get("random_seed", 2026)),
+            deterministic=bool(self.config.get("deterministic_run", True)),
+            benchmark=bool(self.config.get("cudnn_benchmark", False)),
+            matmul_precision=str(self.config.get("matmul_precision", "highest")),
+        )
         self.log.info(f"HyR-DPA switches | {self.hyr_dpa.describe()}")
 
         self.runtime_records = []
@@ -159,17 +171,42 @@ class OptimizedExperimentRunner:
 
         dataset_dir = self._dataset_dir()
 
-        subject_files = sorted([f for f in os.listdir(dataset_dir) if f.endswith(".npz") and "_10band" not in f])
+        def _subject_sort_key(filename: str):
+            m = re.search(r"sub(\d+)", filename)
+            return int(m.group(1)) if m else float("inf")
+
+        subject_files = sorted(
+            [f for f in os.listdir(dataset_dir) if f.endswith(".npz") and "_10band" not in f],
+            key=_subject_sort_key,
+        )
         if not subject_files:
             raise RuntimeError(f"No subject .npz files found in dataset directory: {dataset_dir}")
 
         fold_files = list(subject_files)
+        start_id_raw = self.config.get("held_out_start_id", None)
+        end_id_raw = self.config.get("held_out_end_id", None)
+        start_id = None if start_id_raw in (None, "", "None", "none", "null", "NULL") else int(start_id_raw)
+        end_id = None if end_id_raw in (None, "", "None", "none", "null", "NULL") else int(end_id_raw)
+        if start_id is not None or end_id is not None:
+            filtered = []
+            for filename in fold_files:
+                m = re.search(r"sub(\d+)", filename)
+                if not m:
+                    continue
+                sid = int(m.group(1))
+                if start_id is not None and sid < start_id:
+                    continue
+                if end_id is not None and sid > end_id:
+                    continue
+                filtered.append(filename)
+            fold_files = filtered
+
         n_fold = self.config.get("n_fold", None)
         if n_fold not in (None, "", "None", "none", "null", "NULL"):
             n_fold = int(n_fold)
             if n_fold > 0:
                 fold_files = fold_files[: min(n_fold, len(fold_files))]
-                self.log.info(
+                self._log_detail(
                     f"Quick-fold mode enabled | n_fold={n_fold} | running {len(fold_files)}/{len(subject_files)} held-out subjects"
                 )
 
@@ -184,15 +221,29 @@ class OptimizedExperimentRunner:
         self._get_init_state()
 
         metric_history = {k: [] for k in ["AUC", "BA", "F1", "TPR", "FPR"]}
+        completed_subject_ids: List[int] = []
+        resume_metrics = self._load_latest_subject_metrics_from_log()
 
         with MemoryManager.cuda_memory_context():
             for filename in fold_files:
-                set_random_seed(int(self.config.get("random_seed", 2026)))
+                set_random_seed(
+                    int(self.config.get("random_seed", 2026)),
+                    deterministic=bool(self.config.get("deterministic_run", True)),
+                    benchmark=bool(self.config.get("cudnn_benchmark", False)),
+                    matmul_precision=str(self.config.get("matmul_precision", "highest")),
+                )
 
                 m = re.search(r"sub(\d+)", filename)
                 if not m:
                     continue
                 subject_id = int(m.group(1))
+                if subject_id in resume_metrics:
+                    metrics = resume_metrics[subject_id]
+                    self._log_detail(f"Resume mode | skip finished subject {subject_id} from latest log block")
+                    for k in metric_history:
+                        metric_history[k].append(metrics[k])
+                    completed_subject_ids.append(subject_id)
+                    continue
                 source_scores, manual_sources, forced_mode = self._fold_source_selection_inputs(
                     test_subject_id=subject_id,
                     subject_file_map=subject_file_map,
@@ -210,8 +261,9 @@ class OptimizedExperimentRunner:
                 self._log_subject(subject_id, metrics)
                 for k in metric_history:
                     metric_history[k].append(metrics[k])
+                completed_subject_ids.append(subject_id)
 
-        self._save_results(metric_history)
+        self._save_results(metric_history, subject_ids=completed_subject_ids)
         self._save_source_selection()
         self._save_rpcs_artifacts()
 
@@ -240,7 +292,7 @@ class OptimizedExperimentRunner:
             out_csv = self.exp_dir / "runtime_dataset_summary.csv"
             rt_df_out.to_csv(out_csv, index=False, encoding="utf-8-sig")
             pretty = {k: f"{mean_row[k]:.3f}+/-{std_row[k]:.3f}" for k in cols if k in mean_row and k in std_row}
-            self.log.info(f"[RUNTIME-DATASET] {pretty}")
+            self._log_detail(f"[RUNTIME-DATASET] {pretty}")
 
     def _fold_source_selection_inputs(
         self,
@@ -344,7 +396,7 @@ class OptimizedExperimentRunner:
             rpcs_weighted_sampling=bool(rpt_cfg.get("weighted_sampling", True)),
         )
         augmentor.prepare()
-        self.log.info(
+        self._log_detail(
             f"RPT-Aug ready for sub{subject_id} | selected_sources={len(selected_subjects)} "
             f"| source_pos_trials={sum(int(v.shape[0]) for v in source_p300_trials.values())} "
             f"| target_bg_trials={int(target_bg_trials.shape[0])}"
@@ -362,7 +414,7 @@ class OptimizedExperimentRunner:
 
         del model
         elapsed = _t.perf_counter() - t0
-        self.log.info(f"Subject {subject_id} completed in {elapsed:.2f}s")
+        self._log_detail(f"Subject {subject_id} completed in {elapsed:.2f}s")
         return {k: round(v, 4) for k, v in zip(["AUC", "BA", "F1", "TPR", "FPR"], metric_values)}
 
     def _run_single_subject(self, model: nn.Module, subject_id: int) -> Tuple[float, float, float, float, float]:
@@ -377,7 +429,7 @@ class OptimizedExperimentRunner:
                 n_class=int(self.config.get("n_class", 2)),
                 device=self.device,
             )
-            self.log.info(f"Subject {subject_id} source class weights: {class_weights.detach().cpu().tolist()}")
+            self._log_detail(f"Subject {subject_id} source class weights: {class_weights.detach().cpu().tolist()}")
 
         rpt_augmentor = self._build_rpt_augmentor_for_fold(subject_id)
         iahm_cfg = self.hyr_dpa.build_iahm_config()
@@ -416,13 +468,13 @@ class OptimizedExperimentRunner:
         if self.config.get("is_training", True):
             mode = str(self.config.get("training_mode", "End2End")).strip().lower()
             if mode == "decoupled":
-                self.log.info("Training mode: Decoupled | Stage 1 (feature alignment scaffold)")
+                self._log_detail("Training mode: Decoupled | Stage 1 (feature alignment scaffold)")
                 self.hyr_dpa.stage1_feature_alignment()
                 self._train(trainer)
-                self.log.info("Training mode: Decoupled | Stage 2 (classifier rectification scaffold)")
+                self._log_detail("Training mode: Decoupled | Stage 2 (classifier rectification scaffold)")
                 self.hyr_dpa.stage2_classifier_rectification()
             else:
-                self.log.info("Training mode: End2End")
+                self._log_detail("Training mode: End2End")
                 self._train(trainer)
 
         return self._eval(trainer, ckpt_dir)
@@ -430,26 +482,45 @@ class OptimizedExperimentRunner:
     def _train(self, trainer):
         """Build dataloaders and run fit()."""
         cfg = self.config
-        batch_size = int(cfg["batch_size"])
+        train_unit_batch_size = int(cfg["subject_batch_size"])
+        val_bs_raw = cfg.get("val_batch_size", None)
+        if val_bs_raw in (None, "", "None", "none", "null", "NULL"):
+            val_batch_size = int(train_unit_batch_size)
+        else:
+            val_batch_size = int(val_bs_raw)
         use_target_stream = bool(cfg.get("use_target_stream", False))
         need_target_stream = bool(cfg.get("rpt_aug_enable", False)) or float(cfg.get("lambda_align", 0.0)) > 0.0
         if need_target_stream and not use_target_stream:
             use_target_stream = True
-            self.log.info("Stage-1 alignment enabled -> force `use_target_stream=True` for training.")
+            self._log_detail("Stage-1 alignment enabled -> force `use_target_stream=True` for training.")
         if use_target_stream:
-            train_loader = self.datamodule.train_dataloader(batch_size=batch_size)
+            train_loader = self.datamodule.train_dataloader(target_batch_size=train_unit_batch_size)
         else:
-            train_loader = self.datamodule.source_train_dataloader(batch_size=batch_size)
-        val_loader = self.datamodule.val_dataloader(batch_size=batch_size)
+            train_loader = self.datamodule.source_train_dataloader()
+        val_loader = self.datamodule.val_dataloader(batch_size=val_batch_size)
         train_steps = len(train_loader) if hasattr(train_loader, "__len__") else None
-        self.log.info(
+        val_steps = len(val_loader) if hasattr(val_loader, "__len__") else None
+        effective_train_batch_size = int(
+            getattr(
+                train_loader,
+                "batch_size",
+                int(cfg["subjects_per_batch"]) * int(cfg["subject_batch_size"]),
+            )
+        )
+        self._log_detail(
             f"Training setup | use_target_stream={use_target_stream} | "
             f"train_samples={len(self.datamodule.train_dataset)} | "
             f"val_samples={len(self.datamodule.val_dataset)} | "
             f"train_steps={train_steps} | "
+            f"val_steps={val_steps} | "
+            f"effective_train_batch_size={effective_train_batch_size} | "
+            f"val_batch_size={val_batch_size} | "
             f"subject_batch_policy={getattr(self.datamodule, 'train_subject_batch_policy', None)} | "
             f"subjects_per_batch={getattr(self.datamodule, 'train_subjects_per_batch', None)} | "
-            f"subject_batch_size={getattr(self.datamodule, 'train_subject_batch_size', None)}"
+            f"subject_batch_size={getattr(self.datamodule, 'train_subject_batch_size', None)} | "
+            f"step_ref_mode={getattr(self.datamodule, 'train_step_reference_mode', None)} | "
+            f"step_ref_subject={getattr(self.datamodule, 'train_step_reference_subject', None)} | "
+            f"step_ref_samples={getattr(self.datamodule, 'train_step_reference_samples', None)}"
         )
 
         trainer.fit(train_loader, val_loader, stage=2, epochs=int(cfg["epochs"]))
@@ -465,7 +536,12 @@ class OptimizedExperimentRunner:
 
         test_loader = self.datamodule.test_dataloader(batch_size=int(self.config.get("test_batch_size", 1000)))
 
-        metrics = trainer._run_epoch(test_loader, training=False, loss_fn=trainer.loss_fn)
+        metrics = trainer._run_epoch(
+            test_loader,
+            training=False,
+            loss_fn=trainer.loss_fn,
+            profile_runtime=bool(self.config.get("log_runtime", True)),
+        )
 
         rt = getattr(trainer, "last_runtime_stats", None)
         try:
@@ -479,7 +555,7 @@ class OptimizedExperimentRunner:
             row.update(rt)
             self.runtime_records.append(row)
 
-            self.log.info("[RUNTIME] " + " | ".join(
+            self._log_detail("[RUNTIME] " + " | ".join(
                 f"{k}: {rt[k]:.3f}" if isinstance(rt[k], (int, float)) else f"{k}: {rt[k]}"
                 for k in [
                     "model_p50_ms",
@@ -525,10 +601,50 @@ class OptimizedExperimentRunner:
             f"| F1: {metrics['F1']:.4f} | TPR: {metrics['TPR']:.4f} | FPR: {metrics['FPR']:.4f}"
         )
 
-    def _save_results(self, results: Dict[str, List[float]]):
+    def _load_latest_subject_metrics_from_log(self) -> Dict[int, Dict[str, float]]:
+        if self.log is None or not getattr(self.log, "name", None):
+            return {}
+        log_path = Path(f"{self.log.name}.log")
+        if not log_path.exists():
+            return {}
+
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+
+        start_mark = f"Starting training for model: {self.config.get('model')}"
+        start_idx = None
+        for idx, line in enumerate(lines):
+            if start_mark in line:
+                start_idx = idx
+        if start_idx is None:
+            return {}
+
+        metric_re = re.compile(
+            r"Subject\s+(\d+)\s+\|\s+AUC:\s+([0-9.]+)\s+\|\s+BA:\s+([0-9.]+)\s+\|\s+F1:\s+([0-9.]+)\s+\|\s+TPR:\s+([0-9.]+)\s+\|\s+FPR:\s+([0-9.]+)"
+        )
+        parsed: Dict[int, Dict[str, float]] = {}
+        for line in lines[start_idx + 1:]:
+            m = metric_re.search(line)
+            if not m:
+                continue
+            sid = int(m.group(1))
+            parsed[sid] = {
+                "AUC": float(m.group(2)),
+                "BA": float(m.group(3)),
+                "F1": float(m.group(4)),
+                "TPR": float(m.group(5)),
+                "FPR": float(m.group(6)),
+            }
+        return parsed
+
+    def _save_results(self, results: Dict[str, List[float]], subject_ids: Optional[List[int]] = None):
         """Aggregate subject metrics, append AVG/STD, and save CSV."""
         df = pd.DataFrame(results)
-        df.insert(0, "SUB", [f"SUB{i+1}" for i in range(len(df))])
+        if subject_ids is None or len(subject_ids) != len(df):
+            subject_ids = list(range(1, len(df) + 1))
+        df.insert(0, "SUB", [f"SUB{i}" for i in subject_ids])
 
         metrics = ["AUC", "BA", "F1", "TPR", "FPR"]
         avg = df[metrics].mean().round(4)
@@ -545,14 +661,18 @@ class OptimizedExperimentRunner:
 
         formatted = {k: f"{avg[k]:.4f}+/-{std[k]:.4f}" for k in metrics}
         self.log.info(f"Average metrics: {formatted}")
-        self.log.info(f"Results saved to {csv_path}")
+        self._log_detail(f"Results saved to {csv_path}")
 
     def _record_source_selection(self, subject_id: int):
         info = dict(getattr(self.datamodule, "source_selection_info", {}) or {})
         if not info:
             return
         selected = info.get("selected_subjects", [])
-        self.log.info(
+        selected_ids = [
+            int(str(s)[3:]) for s in selected
+            if isinstance(s, str) and str(s).startswith("sub") and str(s)[3:].isdigit()
+        ]
+        self._log_detail(
             f"Subject {subject_id} source selection | mode={info.get('mode')} | "
             f"selected={info.get('num_selected')}/{info.get('num_candidates')} | "
             f"subjects={selected}"
@@ -563,9 +683,12 @@ class OptimizedExperimentRunner:
                 "mode": info.get("mode"),
                 "k": info.get("k"),
                 "min_score": info.get("min_score"),
+                "selection_seed": info.get("selection_seed"),
+                "held_out_subject": f"sub{subject_id}",
                 "num_candidates": info.get("num_candidates"),
                 "num_selected": info.get("num_selected"),
                 "selected_subjects": ",".join(selected),
+                "selected_subject_ids": ",".join(str(v) for v in selected_ids),
             }
         )
         self._record_rpcs_details(subject_id, selected_subjects=selected)
@@ -576,7 +699,19 @@ class OptimizedExperimentRunner:
         df = pd.DataFrame(self.source_selection_records)
         out = self.exp_dir / "source_selection.csv"
         df.to_csv(out, index=False, encoding="utf-8-sig")
-        self.log.info(f"Source selection records saved to {out}")
+        self._log_detail(f"Source selection records saved to {out}")
+
+        # Human-readable manifest for quick copy/reuse of LOSO source pools.
+        manifest = self.exp_dir / "source_selection_manifest.txt"
+        lines: List[str] = []
+        lines.append(f"dataset={self.config.get('dataset')} | seed={self.config.get('random_seed')}")
+        for row in self.source_selection_records:
+            lines.append(
+                f"{row.get('held_out_subject')} | mode={row.get('mode')} | "
+                f"k={row.get('k')} | selected={row.get('selected_subjects')}"
+            )
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._log_detail(f"Source selection manifest saved to {manifest}")
 
     def _record_rpcs_details(self, subject_id: int, selected_subjects: List[str]):
         meta = dict(getattr(self.hyr_dpa, "last_source_selection_meta", {}) or {})
@@ -879,8 +1014,8 @@ class OptimizedExperimentRunner:
         except Exception as _e:
             self.log.warning(f"R-PCS visualization save failed: {_e}")
 
-        self.log.info(f"R-PCS ranking records saved to {out_long}")
-        self.log.info(f"R-PCS selected-source records saved to {out_selected}")
+        self._log_detail(f"R-PCS ranking records saved to {out_long}")
+        self._log_detail(f"R-PCS selected-source records saved to {out_selected}")
 
 
 class OptimizedTrainer:
@@ -906,7 +1041,8 @@ class OptimizedTrainer:
 
         self.loss_fn = self.loss_ce
 
-        self.scaler = GradScaler()
+        scaler_device = "cuda" if self.device.type == "cuda" else "cpu"
+        self.scaler = torch.amp.GradScaler(scaler_device, enabled=(self.device.type == "cuda"))
         self.tb_logger = None
         self.checkpoint_dir = None
         self.current_epoch = 0
@@ -914,6 +1050,10 @@ class OptimizedTrainer:
         self.log_runtime: bool = bool(self.config.get("log_runtime", True))
         self.rt_deadline_ms: float = float(self.config.get("rt_deadline_ms", 200.0))
         self.last_runtime_stats: dict | None = None
+        self.minimal_log: bool = bool(self.config.get("minimal_log", True))
+        self.debug_domain_batch: bool = bool(self.config.get("debug_domain_batch", False))
+        self.debug_domain_batch_max_steps: int = int(self.config.get("debug_domain_batch_max_steps", 3))
+        self._debug_domain_steps_emitted: int = 0
 
         # Stage-1 optional modules (RPT-Aug + IAHM)
         self.stage1_rpt_augmentor: Optional[RPTAugmentor] = None
@@ -934,6 +1074,30 @@ class OptimizedTrainer:
             self.logger.info(msg)
         else:
             print(msg)
+
+    @staticmethod
+    def _print_console(msg: str) -> None:
+        print(msg, flush=True)
+
+    def _maybe_log_domain_debug(self, source_domain_id: Optional[torch.Tensor]) -> None:
+        if not self.debug_domain_batch:
+            return
+        if source_domain_id is None or source_domain_id.numel() == 0:
+            return
+        if self._debug_domain_steps_emitted >= max(0, self.debug_domain_batch_max_steps):
+            return
+
+        domain_cpu = source_domain_id.detach().to("cpu")
+        unique_ids, counts = torch.unique(domain_cpu, sorted=True, return_counts=True)
+        domain_ids = [int(v) for v in unique_ids.tolist()]
+        count_values = [int(v) for v in counts.tolist()]
+        count_map = {int(k): int(v) for k, v in zip(domain_ids, count_values)}
+        self._debug_domain_steps_emitted += 1
+        self._log_info(
+            f"[DOMAIN-DEBUG] epoch={self.current_epoch:03d} "
+            f"step={self._debug_domain_steps_emitted:03d} "
+            f"n_domains={len(domain_ids)} domains={domain_ids} counts={count_map}"
+        )
 
     def setup_logging(self, log_dir: Path, checkpoint_dir: Path, stage: int, *, run_name: str):
         self.checkpoint_dir = checkpoint_dir
@@ -978,15 +1142,28 @@ class OptimizedTrainer:
         for epoch in range(1, epochs + 1):
             self.current_epoch = epoch
             with MemoryManager.cuda_memory_context():
-                train_metrics = self._run_epoch(train_loader, training=True, loss_fn=self.loss_fn)
+                train_metrics = self._run_epoch(
+                    train_loader,
+                    training=True,
+                    loss_fn=self.loss_fn,
+                    profile_runtime=False,
+                )
                 train_loss_avg = train_metrics[0][0][0]
                 train_ba = train_metrics[2]
 
-                val_metrics = self._run_epoch(val_loader, training=False, loss_fn=self.loss_fn)
+                val_metrics = self._run_epoch(
+                    val_loader,
+                    training=False,
+                    loss_fn=self.loss_fn,
+                    profile_runtime=False,
+                )
                 val_loss_avg = val_metrics[0][0][0]
                 val_ba = val_metrics[2]
 
-                self._display_progress(epoch, epochs, train_loss_avg, val_loss_avg, val_ba)
+                if self.minimal_log:
+                    self._display_progress_console(epoch, epochs, train_loss_avg, val_loss_avg, val_ba)
+                else:
+                    self._display_progress(epoch, epochs, train_loss_avg, val_loss_avg, val_ba)
                 self._log_training_metrics(train_metrics, mode="train", stage=stage)
                 self._log_training_metrics(val_metrics, mode="val", stage=stage)
                 if self.tb_logger is not None and train_ba is not None and val_ba is not None:
@@ -1006,10 +1183,16 @@ class OptimizedTrainer:
                     no_improve_epochs += 1
 
                 if epoch > early_stop_start_epoch and no_improve_epochs >= patience:
-                    self._log_info(
-                        f"Early stopping triggered on BA | epoch={epoch} | "
-                        f"start_epoch={early_stop_start_epoch} | patience={patience} | best_BA={best_ba:.4f}"
-                    )
+                    if self.minimal_log:
+                        self._print_console(
+                            f"Early stopping triggered on BA | epoch={epoch} | "
+                            f"start_epoch={early_stop_start_epoch} | patience={patience} | best_BA={best_ba:.4f}"
+                        )
+                    else:
+                        self._log_info(
+                            f"Early stopping triggered on BA | epoch={epoch} | "
+                            f"start_epoch={early_stop_start_epoch} | patience={patience} | best_BA={best_ba:.4f}"
+                        )
                     break
 
                 self.scheduler.step()
@@ -1209,7 +1392,7 @@ class OptimizedTrainer:
         return aux_total, aux_items
 
     # ---------- epoch core ----------
-    def _run_epoch(self, dataloader, *, training: bool, loss_fn: Callable):
+    def _run_epoch(self, dataloader, *, training: bool, loss_fn: Callable, profile_runtime: bool = False):
         """
         Run one training/eval epoch and return:
           [
@@ -1218,7 +1401,7 @@ class OptimizedTrainer:
           ]
         """
         self.model.train() if training else self.model.eval()
-        collect_runtime = (self.log_runtime and (not training))
+        collect_runtime = bool((not training) and profile_runtime)
         pre_times_ms, model_times_ms, e2e_times_ms = [], [], []
 
         if collect_runtime and torch.cuda.is_available():
@@ -1242,20 +1425,32 @@ class OptimizedTrainer:
                 x = batch[0].to(self.device, non_blocking=True)
                 y = batch[1].to(self.device, non_blocking=True)
                 target_x = None
-                if len(batch) >= 3 and batch[2] is not None:
-                    target_x = batch[2].to(self.device, non_blocking=True)
+                source_domain_id = None
+                if len(batch) == 3 and batch[2] is not None:
+                    candidate = batch[2]
+                    if isinstance(candidate, torch.Tensor) and candidate.ndim == 1 and candidate.shape[0] == y.shape[0]:
+                        source_domain_id = candidate.to(self.device, non_blocking=True)
+                    else:
+                        target_x = candidate.to(self.device, non_blocking=True)
+                elif len(batch) >= 4:
+                    if batch[2] is not None:
+                        target_x = batch[2].to(self.device, non_blocking=True)
+                    if batch[3] is not None:
+                        source_domain_id = batch[3].to(self.device, non_blocking=True)
+                if training:
+                    self._maybe_log_domain_debug(source_domain_id)
                 sample_count += x.size(0)
                 if len(x.shape) == 3:
                     x = x.unsqueeze(1)
 
-                if torch.cuda.is_available():
+                if collect_runtime and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t1 = _t.perf_counter()
 
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
 
-                with autocast():
+                with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
                     logits, extras = self._forward_unpack(x)
                     loss_total, items = loss_fn(logits, y, extras)
                     if training and self._stage1_has_aux():
@@ -1274,7 +1469,7 @@ class OptimizedTrainer:
                     probs = torch.softmax(logits, dim=1)
                     preds = logits.argmax(1)
 
-                if torch.cuda.is_available():
+                if collect_runtime and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t2 = _t.perf_counter()
 
@@ -1301,7 +1496,7 @@ class OptimizedTrainer:
                 all_probs.append(probs.detach().cpu())
                 all_preds.append(preds.detach().cpu())
                 all_targets.append(y.detach().cpu())
-                MemoryManager.cleanup_tensors(x, y, logits)
+                MemoryManager.cleanup_tensors(x, y, logits, source_domain_id)
 
         probabilities = torch.cat(all_probs) if len(all_probs) else torch.empty(0)
         predictions = torch.cat(all_preds) if len(all_preds) else torch.empty(0, dtype=torch.long)
@@ -1443,6 +1638,12 @@ class OptimizedTrainer:
 
     def _display_progress(self, epoch: int, epochs: int, train_loss, val_loss: float, val_ba: float):
         self._log_info(
+            f"Epoch {epoch:03d}/{epochs:3d} | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val BA: {val_ba:.4f}"
+        )
+
+    def _display_progress_console(self, epoch: int, epochs: int, train_loss, val_loss: float, val_ba: float):
+        self._print_console(
             f"Epoch {epoch:03d}/{epochs:3d} | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val BA: {val_ba:.4f}"
         )
