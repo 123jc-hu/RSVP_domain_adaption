@@ -354,3 +354,132 @@ def euclidean_to_lorentz(x: torch.Tensor, K: float = -1.0, eps: float = 1e-7) ->
     sq = torch.sum(x * x, dim=-1, keepdim=True)
     z0 = torch.sqrt(torch.clamp((1.0 / kabs) + sq, min=eps))
     return torch.cat([z0, x], dim=-1)
+
+
+class EuclideanClassCentroids(nn.Module):
+    def __init__(self, n_classes: int, embed_dim: int, momentum: float = 0.1):
+        super().__init__()
+        self.n_classes = int(n_classes)
+        self.embed_dim = int(embed_dim)
+        self.momentum = float(momentum)
+        self.register_buffer("centers", torch.zeros(self.n_classes, self.embed_dim, dtype=torch.float32))
+        self.register_buffer("initialized", torch.zeros(self.n_classes, dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, z: torch.Tensor, y: torch.Tensor) -> None:
+        y = y.long()
+        for c in range(self.n_classes):
+            mask = (y == c)
+            if not torch.any(mask):
+                continue
+            z_c = z[mask]
+            mean_c = torch.mean(z_c, dim=0)
+            if not bool(self.initialized[c]):
+                self.centers[c] = mean_c
+                self.initialized[c] = torch.tensor(True, device=self.initialized.device)
+            else:
+                self.centers[c] = (1.0 - self.momentum) * self.centers[c] + self.momentum * mean_c
+
+    def get_centers(self) -> torch.Tensor:
+        return self.centers
+
+
+class EuclideanIAHMLoss(nn.Module):
+    """
+    Euclidean analogue of IAHM with the same radial / compact / margin structure.
+    """
+
+    def __init__(
+        self,
+        n_classes: int,
+        embed_dim: int,
+        class_counts: Optional[Sequence[int]] = None,
+        r0: float = 1.0,
+        gamma: float = 1.0,
+        m0: float = 1.0,
+        margin_alpha: float = 0.25,
+        lambda_r: float = 1.0,
+        lambda_c: float = 0.5,
+        lambda_m: float = 1.0,
+        centroid_momentum: float = 0.1,
+        eps: float = 1e-7,
+    ):
+        super().__init__()
+        self.n_classes = int(n_classes)
+        self.embed_dim = int(embed_dim)
+        self.eps = float(eps)
+
+        if class_counts is None:
+            class_counts = [1 for _ in range(self.n_classes)]
+        if len(class_counts) != self.n_classes:
+            raise ValueError(
+                f"class_counts length ({len(class_counts)}) != n_classes ({self.n_classes})"
+            )
+
+        target_r = compute_target_radii(class_counts, r0=r0, gamma=gamma)
+        margins = compute_margins(class_counts, m0=m0, alpha=margin_alpha)
+        self.register_buffer("target_radii", target_r)
+        self.register_buffer("margins", margins)
+
+        self.centroids = EuclideanClassCentroids(
+            n_classes=self.n_classes,
+            embed_dim=self.embed_dim,
+            momentum=float(centroid_momentum),
+        )
+        self.lambda_r = float(lambda_r)
+        self.lambda_c = float(lambda_c)
+        self.lambda_m = float(lambda_m)
+
+    def forward(self, z: torch.Tensor, y: torch.Tensor, update_centroids: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if z.ndim != 2 or z.shape[1] != self.embed_dim:
+            raise ValueError(
+                f"Euclidean IAHM expects z shape [B,{self.embed_dim}], got {tuple(z.shape)}"
+            )
+        y = y.long()
+        if z.shape[0] != y.shape[0]:
+            raise ValueError(f"Batch mismatch: z batch={z.shape[0]} vs y batch={y.shape[0]}")
+
+        if update_centroids:
+            self.centroids.update(z.detach(), y)
+        centers = self.centroids.get_centers()
+
+        r = torch.linalg.norm(z, dim=-1)
+        target = self.target_radii[y]
+        loss_radial = F.smooth_l1_loss(r, target)
+
+        same_center = centers[y]
+        dist_same = torch.linalg.norm(z - same_center, dim=-1)
+        loss_compact = torch.mean(dist_same * dist_same)
+
+        if self.n_classes == 2:
+            opp = 1 - y
+            opp_center = centers[opp]
+            dist_opp = torch.linalg.norm(z - opp_center, dim=-1)
+        else:
+            dist_all = []
+            for c in range(self.n_classes):
+                c_center = centers[c].unsqueeze(0).expand_as(z)
+                dist_all.append(torch.linalg.norm(z - c_center, dim=-1))
+            dist_stack = torch.stack(dist_all, dim=1)
+            own_mask = F.one_hot(y, num_classes=self.n_classes).bool()
+            dist_stack = dist_stack.masked_fill(own_mask, float("inf"))
+            dist_opp, _ = torch.min(dist_stack, dim=1)
+
+        required = self.margins[y]
+        loss_margin = torch.mean(F.relu(required - dist_opp))
+
+        loss = (
+            self.lambda_r * loss_radial
+            + self.lambda_c * loss_compact
+            + self.lambda_m * loss_margin
+        )
+        details = {
+            "radial": float(loss_radial.detach().item()),
+            "compact": float(loss_compact.detach().item()),
+            "margin": float(loss_margin.detach().item()),
+            "target_radius_bg": float(self.target_radii[0].detach().item()) if self.n_classes >= 1 else float("nan"),
+            "target_radius_p300": float(self.target_radii[1].detach().item()) if self.n_classes >= 2 else float("nan"),
+            "margin_bg": float(self.margins[0].detach().item()) if self.n_classes >= 1 else float("nan"),
+            "margin_p300": float(self.margins[1].detach().item()) if self.n_classes >= 2 else float("nan"),
+        }
+        return loss, details

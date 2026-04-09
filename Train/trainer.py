@@ -15,12 +15,14 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from lightning.pytorch.loggers import TensorBoardLogger
+from torch.utils.data import DataLoader
 
-from Data.datamodule import EEGDataModuleCrossSubject
+from Data.datamodule import EEGDataModuleCrossSubject, SubjectBatchDataLoader, DualStreamDataLoader
 from Data.path_resolver import resolve_dataset_dir
+from Data.pccs import build_source_prototypes, build_target_prototype, compute_pccs_source_scores
 from Data.rpt_aug import RPTAugmentor
 from Train.hyr_dpa_framework import HyRDPAScaffold
-from Train.iahm import IAHMLoss, euclidean_to_lorentz
+from Train.iahm import IAHMLoss, EuclideanIAHMLoss, euclidean_to_lorentz
 from Utils.config import set_random_seed
 from Utils.utils import load_from_checkpoint, EarlyStopping, SaveBestValBA
 from Utils.metrics import calculate_metrics, cal_F1_score
@@ -163,6 +165,7 @@ class OptimizedExperimentRunner:
             matmul_precision=str(self.config.get("matmul_precision", "highest")),
         )
         self.log.info(f"HyR-DPA switches | {self.hyr_dpa.describe()}")
+        self.log.info(f"Experiment summary | {self._experiment_summary()}")
 
         self.runtime_records = []
         self.source_selection_records = []
@@ -294,6 +297,185 @@ class OptimizedExperimentRunner:
             pretty = {k: f"{mean_row[k]:.3f}+/-{std_row[k]:.3f}" for k in cols if k in mean_row and k in std_row}
             self._log_detail(f"[RUNTIME-DATASET] {pretty}")
 
+    def _experiment_summary(self) -> str:
+        cfg = self.config
+        parts = [
+            f"model={cfg.get('model')}",
+            f"dataset={cfg.get('dataset')}",
+            f"exp_tag={cfg.get('exp_tag', 'default')}",
+            f"held_out=sub{cfg.get('held_out_start_id', 'all')}~sub{cfg.get('held_out_end_id', 'all')}",
+            f"seed={cfg.get('random_seed', 2026)}",
+            f"source_selection={cfg.get('source_selection', 'All')}",
+            f"batch_policy={cfg.get('all_source_batch_policy', 'all')}",
+            f"subjects_per_batch={cfg.get('subjects_per_batch', 'all')}",
+            f"ea_enable={bool(cfg.get('ea_enable', False))}",
+            f"use_target_stream={bool(cfg.get('use_target_stream', False))}",
+            f"alignment_loss={cfg.get('alignment_loss', 'none')}",
+            f"lambda_align={float(cfg.get('lambda_align', 0.0))}",
+            f"bgds4={bool(cfg.get('source_train_bg_downsample_enable', False))}",
+        ]
+
+        if bool(cfg.get("source_train_bg_downsample_enable", False)):
+            parts.append(
+                f"bg_to_pos_ratio={float(cfg.get('source_train_bg_downsample_bg_to_pos_ratio', 0.0))}"
+            )
+
+        if bool(cfg.get("rsf_enable", False)):
+            parts.extend(
+                [
+                    f"rsf_mode={str(cfg.get('rsf_mode', 'plain')).strip().lower()}",
+                    f"rsf_dim={int(cfg.get('rsf_dim', cfg.get('n_channels', 0)))}",
+                    f"rsf_cov_estimator={str(cfg.get('rsf_cov_estimator', 'lwf')).strip().lower()}",
+                    f"rsf_solver={str(cfg.get('rsf_solver', 'trust-constr')).strip()}",
+                    f"rsf_domain_lambda={float(cfg.get('rsf_domain_lambda', 0.0))}",
+                    f"rsf_fit_max_trials_per_class_per_subject={cfg.get('rsf_fit_max_trials_per_class_per_subject', 'all')}",
+                    f"rsf_fit_balance_classes={bool(cfg.get('rsf_fit_balance_classes', False))}",
+                ]
+            )
+
+        if bool(cfg.get("prototype_enable", False)):
+            parts.extend(
+                [
+                    f"prototype_lambda={float(cfg.get('prototype_lambda', 0.0))}",
+                    f"prototype_momentum={float(cfg.get('prototype_momentum', 0.9))}",
+                    f"prototype_positive_weight={float(cfg.get('prototype_positive_weight', 1.0))}",
+                    f"prototype_background_weight={float(cfg.get('prototype_background_weight', 1.0))}",
+                    f"prototype_separation_lambda={float(cfg.get('prototype_separation_lambda', 0.0))}",
+                    f"prototype_separation_margin={float(cfg.get('prototype_separation_margin', 1.0))}",
+                ]
+            )
+
+        if bool(cfg.get("posdist_enable", False)):
+            parts.extend(
+                [
+                    f"posdist_lambda={float(cfg.get('posdist_lambda', 0.0))}",
+                    f"posdist_start_epoch={int(cfg.get('posdist_start_epoch', 0))}",
+                    f"posdist_var_weight={float(cfg.get('posdist_var_weight', 1.0))}",
+                    f"posdist_momentum={float(cfg.get('posdist_momentum', 0.9))}",
+                    f"posdist_positive_label={int(cfg.get('posdist_positive_label', 1))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetTS":
+            parts.extend(
+                [
+                    f"ts_feature_layer={cfg.get('eegnet_ts_feature_layer', 'block2')}",
+                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
+                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
+                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
+                    "ts_block2_activation=ELU(fixed)",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetDSBN":
+            parts.extend(
+                [
+                    "dsbn_layer=block2_bn",
+                    "dsbn_affine=shared",
+                    "dsbn_target_stats=enabled",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetLDSA":
+            parts.extend(
+                [
+                    "ldsa_layer=block2_bn",
+                    "ldsa_affine=shared",
+                    "ldsa_target_stats=blended",
+                    f"ldsa_target_blend_alpha={float(cfg.get('ldsa_target_blend_alpha', 0.7))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetSWLDSA":
+            parts.extend(
+                [
+                    "swldsa_layer=block2_bn",
+                    "swldsa_affine=shared",
+                    "swldsa_target_stats=similarity_weighted_blended",
+                    f"swldsa_target_blend_alpha={float(cfg.get('swldsa_target_blend_alpha', 0.1))}",
+                    f"swldsa_similarity_tau={float(cfg.get('swldsa_similarity_tau', 1.0))}",
+                    f"swldsa_var_distance_weight={float(cfg.get('swldsa_var_distance_weight', 1.0))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetGSLDSA":
+            parts.extend(
+                [
+                    "gsldsa_layer=block2_bn",
+                    "gsldsa_affine=shared",
+                    "gsldsa_target_stats=golden_subject_blended",
+                    f"gsldsa_target_blend_alpha={float(cfg.get('gsldsa_target_blend_alpha', 0.1))}",
+                    f"gsldsa_var_distance_weight={float(cfg.get('gsldsa_var_distance_weight', 1.0))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetDGLDSA":
+            parts.extend(
+                [
+                    "dgldsa_layer=block2_bn",
+                    "dgldsa_affine=shared",
+                    "dgldsa_target_stats=discriminability_anchor_blended",
+                    f"dgldsa_target_blend_alpha={float(cfg.get('dgldsa_target_blend_alpha', 0.1))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetLSA":
+            parts.extend(
+                [
+                    "lsa_layer=block2_feature",
+                    "lsa_style_transfer=adain_like_target_only",
+                    f"lsa_content_lambda={float(cfg.get('lsa_content_lambda', 0.0))}",
+                    f"lsa_style_momentum={float(cfg.get('lsa_style_momentum', 0.1))}",
+                    f"lsa_init_gate={float(cfg.get('lsa_init_gate', 0.5))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetLSAv2":
+            parts.extend(
+                [
+                    "lsa_v2_layer=block2_feature",
+                    "lsa_v2_style_transfer=similarity_weighted_adain",
+                    f"lsa_content_lambda={float(cfg.get('lsa_content_lambda', 0.0))}",
+                    f"lsa_identity_lambda={float(cfg.get('lsa_identity_lambda', 0.0))}",
+                    f"lsa_style_momentum={float(cfg.get('lsa_style_momentum', 0.1))}",
+                    f"lsa_init_gate={float(cfg.get('lsa_init_gate', 0.1))}",
+                    f"lsa_target_blend_alpha={float(cfg.get('lsa_target_blend_alpha', 0.1))}",
+                    f"lsa_similarity_tau={float(cfg.get('lsa_similarity_tau', 1.0))}",
+                    f"lsa_var_distance_weight={float(cfg.get('lsa_var_distance_weight', 1.0))}",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetAuxTS":
+            parts.extend(
+                [
+                    f"aux_ts_lambda_align={float(cfg.get('eegnet_aux_ts_lambda_align', 0.0))}",
+                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
+                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
+                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
+                    "ts_branch_alignment=global_mmd_aux_only",
+                    "shared_block2_activation=ELU(fixed)",
+                ]
+            )
+
+        if str(cfg.get("model", "")).strip() == "EEGNetDualHead":
+            parts.extend(
+                [
+                    f"dual_output_mode={str(cfg.get('eegnet_dual_output_mode', 'fusion')).strip().lower()}",
+                    f"dual_fusion_flat_weight={float(cfg.get('eegnet_dual_fusion_flat_weight', 0.7))}",
+                    f"dual_fusion_ts_weight={1.0 - float(cfg.get('eegnet_dual_fusion_flat_weight', 0.7))}",
+                    f"dual_lambda_flat_ce={float(cfg.get('eegnet_dual_lambda_flat_ce', 0.0))}",
+                    f"dual_lambda_ts_ce={float(cfg.get('eegnet_dual_lambda_ts_ce', 0.0))}",
+                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
+                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
+                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
+                    "ts_branch_alignment=off",
+                    "flat_branch_alignment=on",
+                    "shared_block2_activation=ELU(fixed)",
+                ]
+            )
+
+        return ", ".join(str(p) for p in parts)
+
     def _fold_source_selection_inputs(
         self,
         test_subject_id: int,
@@ -322,15 +504,6 @@ class OptimizedExperimentRunner:
             return None
 
         meta = dict(getattr(self.hyr_dpa, "last_source_selection_meta", {}) or {})
-        details = dict(meta.get("details", {}) or {})
-        prototypes = dict(details.get("prototypes", {}) or {})
-        if not prototypes:
-            self.log.warning(
-                f"RPT-Aug enabled but R-PCS prototypes missing for sub{subject_id}; "
-                "disable RPT-Aug for this fold."
-            )
-            return None
-
         selected_subjects = list(
             (self.datamodule.source_selection_info or {}).get("selected_subjects", [])
             or self.datamodule.source_subject_keys
@@ -338,6 +511,20 @@ class OptimizedExperimentRunner:
         if not selected_subjects:
             self.log.warning(f"RPT-Aug enabled but selected source list is empty for sub{subject_id}.")
             return None
+
+        fold_stats = self._build_rpt_fold_stats(
+            subject_id=subject_id,
+            selected_subjects=selected_subjects,
+            rpt_cfg=rpt_cfg,
+            meta=meta,
+        )
+        if fold_stats is None:
+            self.log.warning(f"RPT-Aug enabled but fold statistics could not be built for sub{subject_id}.")
+            return None
+        prototypes = dict(fold_stats.get("prototypes", {}) or {})
+        score_map = dict(fold_stats.get("scores", {}) or {})
+        ranking = list(fold_stats.get("ranking", []) or [])
+        selected_subjects = list(fold_stats.get("selected_subjects", []) or selected_subjects)
 
         pos_label = int(self._cfg_pref("rpcs_positive_label", "pccs_positive_label", 1))
         bg_label = int(self._cfg_pref("rpcs_background_label", "pccs_background_label", 0))
@@ -375,11 +562,10 @@ class OptimizedExperimentRunner:
             self.log.warning(f"RPT-Aug enabled but no target background trials available for sub{subject_id}.")
             return None
 
-        ranking = list(details.get("ranking", []) or [])
         rpcs_result = {
             "prototypes": prototypes,
             "ranking": ranking,
-            "scores": {str(r.get("subject")): float(r.get("score", 1.0)) for r in ranking},
+            "scores": score_map,
         }
         augmentor = RPTAugmentor(
             rpcs_result=rpcs_result,
@@ -394,6 +580,7 @@ class OptimizedExperimentRunner:
             cov_shrinkage=float(rpt_cfg.get("cov_shrinkage", 0.0)),
             input_layout=str(rpt_cfg.get("input_layout", "channel_first")),
             rpcs_weighted_sampling=bool(rpt_cfg.get("weighted_sampling", True)),
+            clip_factor=float(rpt_cfg.get("clip_factor", 3.0)),
         )
         augmentor.prepare()
         self._log_detail(
@@ -402,6 +589,176 @@ class OptimizedExperimentRunner:
             f"| target_bg_trials={int(target_bg_trials.shape[0])}"
         )
         return augmentor
+
+    def _build_rpt_fold_stats(
+        self,
+        *,
+        subject_id: int,
+        selected_subjects: List[str],
+        rpt_cfg: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        details = dict(meta.get("details", {}) or {})
+        prototypes = dict(details.get("prototypes", {}) or {})
+        if prototypes:
+            score_map, ranking = self._resolve_rpt_score_map(
+                selected_subjects=selected_subjects,
+                meta=meta,
+                rpt_cfg=rpt_cfg,
+            )
+            return {
+                "prototypes": prototypes,
+                "scores": score_map,
+                "ranking": ranking,
+                "selected_subjects": list(selected_subjects),
+            }
+
+        if self.datamodule.subject_file_map is None:
+            return None
+
+        metric = str(self._cfg_pref("rpcs_mean_metric", "pccs_mean_metric", "riemann")).strip().lower()
+        pos_label = int(self._cfg_pref("rpcs_positive_label", "pccs_positive_label", 1))
+        bg_label = int(self._cfg_pref("rpcs_background_label", "pccs_background_label", 0))
+        max_trials = self._cfg_pref("rpcs_max_trials_per_class", "pccs_max_trials_per_class", 128)
+        min_trials = int(self._cfg_pref("rpcs_min_trials_per_class", "pccs_min_trials_per_class", 4))
+        seed = int(self.config.get("random_seed", 2026))
+        cov_eps = float(rpt_cfg.get("cov_eps", 1e-6))
+        cov_estimator = str(rpt_cfg.get("cov_estimator", "sample"))
+        cov_shrinkage = float(rpt_cfg.get("cov_shrinkage", 0.0))
+        use_correlation = bool(rpt_cfg.get("use_correlation", True))
+        correlation_eps = float(rpt_cfg.get("correlation_eps", 1e-12))
+        input_layout = str(rpt_cfg.get("input_layout", "channel_first"))
+        mean_max_iter = int(self._cfg_pref("rpcs_mean_max_iter", "pccs_mean_max_iter", 20))
+        mean_tol = float(self._cfg_pref("rpcs_mean_tol", "pccs_mean_tol", 1e-6))
+
+        source_pos_map: Dict[str, np.ndarray] = {}
+        source_bg_map: Dict[str, np.ndarray] = {}
+        valid_subjects: List[str] = []
+        for sub in selected_subjects:
+            subject_file = self.datamodule.subject_file_map.get(str(sub))
+            if not subject_file:
+                continue
+            src = build_source_prototypes(
+                subject_key=str(sub),
+                subject_file=str(subject_file),
+                positive_label=pos_label,
+                background_label=bg_label,
+                max_trials_per_class=max_trials,
+                min_trials_per_class=min_trials,
+                seed=seed,
+                cov_eps=cov_eps,
+                cov_shrinkage=cov_shrinkage,
+                cov_estimator=cov_estimator,
+                use_correlation=use_correlation,
+                correlation_eps=correlation_eps,
+                input_layout=input_layout,
+                metric=metric,
+                mean_max_iter=mean_max_iter,
+                mean_tol=mean_tol,
+            )
+            pos_proto = src.get("p300_proto", None)
+            bg_proto = src.get("bg_proto", None)
+            if pos_proto is None or bg_proto is None:
+                continue
+            source_pos_map[str(sub)] = np.asarray(pos_proto, dtype=np.float64)
+            source_bg_map[str(sub)] = np.asarray(bg_proto, dtype=np.float64)
+            valid_subjects.append(str(sub))
+
+        if not valid_subjects:
+            return None
+
+        target_file = self.datamodule.subject_file_map.get(f"sub{int(subject_id)}")
+        if not target_file:
+            return None
+        target_info = build_target_prototype(
+            target_subject_file=str(target_file),
+            background_label=bg_label,
+            min_trials_per_class=min_trials,
+            seed=seed,
+            cov_eps=cov_eps,
+            cov_shrinkage=cov_shrinkage,
+            cov_estimator=cov_estimator,
+            use_correlation=use_correlation,
+            correlation_eps=correlation_eps,
+            input_layout=input_layout,
+            metric=metric,
+            mean_max_iter=mean_max_iter,
+            mean_tol=mean_tol,
+            target_use_all_trials=bool(
+                self._cfg_pref("rpcs_target_use_all_trials", "pccs_target_use_all_trials", True)
+            ),
+            target_max_trials=self._cfg_pref("rpcs_target_max_trials", "pccs_target_max_trials", None),
+            target_bg_mode=str(self._cfg_pref("rpcs_target_bg_mode", "pccs_target_bg_mode", "amplitude")),
+            target_bg_ratio=float(self._cfg_pref("rpcs_target_bg_ratio", "pccs_target_bg_ratio", 0.7)),
+            target_bg_channel_indices=self._cfg_pref(
+                "rpcs_target_bg_channel_indices",
+                "pccs_target_bg_channel_indices",
+                None,
+            ),
+        )
+        target_bg = target_info.get("prototype", None)
+        if target_bg is None:
+            return None
+
+        score_map, ranking = self._resolve_rpt_score_map(
+            selected_subjects=valid_subjects,
+            meta=meta,
+            rpt_cfg=rpt_cfg,
+        )
+        return {
+            "prototypes": {
+                "target_bg": np.asarray(target_bg, dtype=np.float64),
+                "source_pos": source_pos_map,
+                "source_bg": source_bg_map,
+            },
+            "scores": score_map,
+            "ranking": ranking,
+            "selected_subjects": valid_subjects,
+        }
+
+    def _resolve_rpt_score_map(
+        self,
+        *,
+        selected_subjects: List[str],
+        meta: Dict[str, Any],
+        rpt_cfg: Dict[str, Any],
+    ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+        mode = str(rpt_cfg.get("score_mode", "uniform")).strip().lower()
+        subjects = [str(s) for s in selected_subjects]
+        if mode == "uniform":
+            score_map = {s: 1.0 for s in subjects}
+            ranking = [{"subject": s, "score": 1.0} for s in subjects]
+            return score_map, ranking
+
+        ranking_raw = list(meta.get("ranking", []) or [])
+        score_map: Dict[str, float] = {}
+        ranking: List[Dict[str, Any]] = []
+        for row in ranking_raw:
+            sub = row.get("subject", None)
+            if sub is None:
+                continue
+            sub_key = str(sub)
+            if sub_key not in subjects:
+                continue
+            score = float(row.get("score", 1.0))
+            if not np.isfinite(score):
+                continue
+            score_map[sub_key] = score
+            ranking.append({"subject": sub_key, "score": score})
+        if not score_map:
+            details = dict(meta.get("details", {}) or {})
+            raw_scores = details.get("scores", {}) or meta.get("scores", {}) or {}
+            if isinstance(raw_scores, dict):
+                for sub in subjects:
+                    score = float(raw_scores.get(sub, 1.0))
+                    if np.isfinite(score):
+                        score_map[sub] = score
+                        ranking.append({"subject": sub, "score": score})
+        if len(score_map) != len(subjects):
+            score_map = {s: float(score_map.get(s, 1.0)) for s in subjects}
+            ranking = [{"subject": s, "score": score_map[s]} for s in subjects]
+        ranking.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+        return score_map, ranking
 
     def _dataset_dir(self) -> Path:
         return resolve_dataset_dir(self.config)
@@ -422,6 +779,7 @@ class OptimizedExperimentRunner:
         # Build split datasets first so class weights are fold-specific.
         self.datamodule.setup()
         self._record_source_selection(subject_id)
+        self._configure_fold_target_anchor(model=model, subject_id=subject_id)
 
         class_weights = None
         if bool(self.config.get("class_weighted_ce", True)):
@@ -479,6 +837,88 @@ class OptimizedExperimentRunner:
 
         return self._eval(trainer, ckpt_dir)
 
+    def _configure_fold_target_anchor(self, *, model: nn.Module, subject_id: int) -> None:
+        setter = getattr(model, "set_target_anchor_domain_id", None)
+        if not callable(setter):
+            return
+
+        anchor_subject = self._compute_discrim_anchor_subject(subject_id)
+        anchor_id = None
+        if isinstance(anchor_subject, str):
+            m = re.fullmatch(r"sub(\d+)", anchor_subject.strip().lower())
+            if m:
+                anchor_id = int(m.group(1))
+        setter(anchor_id)
+        if anchor_id is not None:
+            self._log_detail(
+                f"Subject {subject_id} target anchor | mode=discriminability_top1 | anchor=sub{anchor_id}"
+            )
+
+    def _compute_discrim_anchor_subject(self, subject_id: int) -> Optional[str]:
+        if self.datamodule.subject_file_map is None or self.datamodule.test_subject_id is None:
+            return None
+
+        held_out = f"sub{int(subject_id)}"
+        target_file = self.datamodule.subject_file_map.get(held_out)
+        if not target_file:
+            return None
+
+        source_keys = list(getattr(self.datamodule, "source_subject_keys", []) or [])
+        if not source_keys:
+            return None
+        source_pool = {
+            str(k): str(self.datamodule.subject_file_map[str(k)])
+            for k in source_keys
+            if str(k) in self.datamodule.subject_file_map
+        }
+        if not source_pool:
+            return None
+
+        pos_label = int(self._cfg_pref("rpcs_positive_label", "pccs_positive_label", 1))
+        bg_label = int(self._cfg_pref("rpcs_background_label", "pccs_background_label", 0))
+        max_trials = self._cfg_pref("rpcs_max_trials_per_class", "pccs_max_trials_per_class", 128)
+        min_trials = int(self._cfg_pref("rpcs_min_trials_per_class", "pccs_min_trials_per_class", 4))
+        seed = int(self.config.get("random_seed", 2026))
+        mean_metric = str(self._cfg_pref("rpcs_mean_metric", "pccs_mean_metric", "riemann"))
+        cov_eps = float(self._cfg_pref("rpcs_cov_eps", "pccs_cov_eps", 1e-6))
+        cov_shrinkage = float(self._cfg_pref("rpcs_cov_shrinkage", "pccs_cov_shrinkage", 0.0))
+        cov_estimator = str(self._cfg_pref("rpcs_cov_estimator", "pccs_cov_estimator", "sample"))
+        use_correlation = bool(self._cfg_pref("rpcs_use_correlation", "pccs_use_correlation", True))
+        correlation_eps = float(self._cfg_pref("rpcs_correlation_eps", "pccs_correlation_eps", 1e-12))
+        input_layout = str(self._cfg_pref("rpcs_input_layout", "pccs_input_layout", "channel_first"))
+        mean_max_iter = int(self._cfg_pref("rpcs_mean_max_iter", "pccs_mean_max_iter", 20))
+        mean_tol = float(self._cfg_pref("rpcs_mean_tol", "pccs_mean_tol", 1e-6))
+        score_eps = float(self._cfg_pref("rpcs_score_eps", "pccs_score_eps", 1e-6))
+
+        _, details = compute_pccs_source_scores(
+            target_subject_file=str(target_file),
+            source_subject_files=source_pool,
+            positive_label=pos_label,
+            background_label=bg_label,
+            max_trials_per_class=max_trials,
+            min_trials_per_class=min_trials,
+            seed=seed,
+            cov_eps=cov_eps,
+            cov_shrinkage=cov_shrinkage,
+            cov_estimator=cov_estimator,
+            use_correlation=use_correlation,
+            correlation_eps=correlation_eps,
+            input_layout=input_layout,
+            mean_metric=mean_metric,
+            distance_metric=mean_metric,
+            mean_max_iter=mean_max_iter,
+            mean_tol=mean_tol,
+            score_mode="discrim_only",
+            score_eps=score_eps,
+            return_details=True,
+            return_prototypes=False,
+        )
+        ranking = list((details or {}).get("ranking", []) or [])
+        if not ranking:
+            return None
+        ranking.sort(key=lambda r: float(r.get("score", float("-inf"))), reverse=True)
+        return str(ranking[0].get("subject"))
+
     def _train(self, trainer):
         """Build dataloaders and run fit()."""
         cfg = self.config
@@ -489,7 +929,13 @@ class OptimizedExperimentRunner:
         else:
             val_batch_size = int(val_bs_raw)
         use_target_stream = bool(cfg.get("use_target_stream", False))
-        need_target_stream = bool(cfg.get("rpt_aug_enable", False)) or float(cfg.get("lambda_align", 0.0)) > 0.0
+        need_target_stream = (
+            bool(cfg.get("rpt_aug_enable", False))
+            or float(cfg.get("lambda_align", 0.0)) > 0.0
+            or float(cfg.get("lambda_class_align", 0.0)) > 0.0
+            or float(cfg.get("lambda_ccl", 0.0)) > 0.0
+            or float(cfg.get("lambda_prior", 0.0)) > 0.0
+        )
         if need_target_stream and not use_target_stream:
             use_target_stream = True
             self._log_detail("Stage-1 alignment enabled -> force `use_target_stream=True` for training.")
@@ -522,6 +968,7 @@ class OptimizedExperimentRunner:
             f"step_ref_subject={getattr(self.datamodule, 'train_step_reference_subject', None)} | "
             f"step_ref_samples={getattr(self.datamodule, 'train_step_reference_samples', None)}"
         )
+        trainer.configure_dynamic_feature_sampling(datamodule=self.datamodule)
 
         trainer.fit(train_loader, val_loader, stage=2, epochs=int(cfg["epochs"]))
 
@@ -535,6 +982,7 @@ class OptimizedExperimentRunner:
         trainer.model.load_state_dict(load_from_checkpoint(Path.cwd() / best_path))
 
         test_loader = self.datamodule.test_dataloader(batch_size=int(self.config.get("test_batch_size", 1000)))
+        trainer._eval_use_target_stats = True
 
         metrics = trainer._run_epoch(
             test_loader,
@@ -542,6 +990,7 @@ class OptimizedExperimentRunner:
             loss_fn=trainer.loss_fn,
             profile_runtime=bool(self.config.get("log_runtime", True)),
         )
+        trainer._eval_use_target_stats = False
 
         rt = getattr(trainer, "last_runtime_stats", None)
         try:
@@ -1065,9 +1514,58 @@ class OptimizedTrainer:
         self.stage1_global_step: int = 0
 
         self.lambda_align: float = float(self.config.get("lambda_align", 0.0))
+        self.lambda_class_align: float = float(self.config.get("lambda_class_align", 0.0))
+        self.lambda_ccl: float = float(self.config.get("lambda_ccl", 0.0))
+        self.class_align_start_epoch: int = int(self.config.get("class_align_start_epoch", 30))
+        self.class_align_conf_thresh: float = float(self.config.get("class_align_conf_thresh", 0.8))
+        self.class_align_min_conf_samples: int = int(self.config.get("class_align_min_conf_samples", 8))
+        self.class_align_use_soft_weights: bool = bool(self.config.get("class_align_use_soft_weights", True))
+        self.ccl_start_epoch: int = int(self.config.get("ccl_start_epoch", 0))
+        self.lambda_prior: float = float(self.config.get("lambda_prior", 0.0))
+        self.prior_start_epoch: int = int(self.config.get("prior_start_epoch", 30))
+        self.prior_min: float = float(self.config.get("prior_min", 0.03))
+        self.prior_max: float = float(self.config.get("prior_max", 0.09))
+        self.prior_loss_type: str = str(self.config.get("prior_loss_type", "l2")).strip().lower()
         self.alignment_loss_name: str = str(self.config.get("alignment_loss", "mmd")).strip().lower()
+        self.lmmd_use_soft_target: bool = bool(self.config.get("lmmd_use_soft_target", True))
+        self.lmmd_kernel_mul: float = float(self.config.get("lmmd_kernel_mul", 2.0))
+        self.lmmd_kernel_num: int = int(self.config.get("lmmd_kernel_num", 5))
+        self.lmmd_fix_sigma = self.config.get("lmmd_fix_sigma", None)
+        self.uot_eps: float = float(self.config.get("uot_eps", 0.1))
+        self.uot_tau_source: float = float(self.config.get("uot_tau_source", 1.0))
+        self.uot_tau_target: float = float(self.config.get("uot_tau_target", 1.0))
+        self.uot_max_iter: int = int(self.config.get("uot_max_iter", 30))
+        self.dual_head_lambda_flat_ce: float = float(self.config.get("eegnet_dual_lambda_flat_ce", 0.0))
+        self.dual_head_lambda_ts_ce: float = float(self.config.get("eegnet_dual_lambda_ts_ce", 0.0))
+        self.aux_ts_lambda_align: float = float(self.config.get("eegnet_aux_ts_lambda_align", 0.0))
+        self.lsa_content_lambda: float = float(self.config.get("lsa_content_lambda", 0.0))
+        self.lsa_identity_lambda: float = float(self.config.get("lsa_identity_lambda", 0.0))
+        self.prototype_enable: bool = bool(self.config.get("prototype_enable", False))
+        self.prototype_lambda: float = float(self.config.get("prototype_lambda", 0.0))
+        self.prototype_momentum: float = float(self.config.get("prototype_momentum", 0.9))
+        self.prototype_positive_weight: float = float(self.config.get("prototype_positive_weight", 1.0))
+        self.prototype_background_weight: float = float(self.config.get("prototype_background_weight", 1.0))
+        self.prototype_positive_label: int = int(self.config.get("prototype_positive_label", 1))
+        self.prototype_background_label: int = int(self.config.get("prototype_background_label", 0))
+        self.prototype_separation_lambda: float = float(self.config.get("prototype_separation_lambda", 0.0))
+        self.prototype_separation_margin: float = float(self.config.get("prototype_separation_margin", 1.0))
+        self.prototype_vectors: Optional[torch.Tensor] = None
+        self.prototype_initialized: Optional[torch.Tensor] = None
+        self.posdist_enable: bool = bool(self.config.get("posdist_enable", False))
+        self.posdist_lambda: float = float(self.config.get("posdist_lambda", 0.0))
+        self.posdist_start_epoch: int = int(self.config.get("posdist_start_epoch", 0))
+        self.posdist_var_weight: float = float(self.config.get("posdist_var_weight", 1.0))
+        self.posdist_momentum: float = float(self.config.get("posdist_momentum", 0.9))
+        self.posdist_positive_label: int = int(self.config.get("posdist_positive_label", 1))
+        self.posdist_mean: Optional[torch.Tensor] = None
+        self.posdist_var: Optional[torch.Tensor] = None
+        self.posdist_initialized: bool = False
         self.rpt_synth_per_batch_cfg = self.config.get("rpt_aug_n_synth_per_batch", None)
+        self.rpt_inject_to_ce: bool = bool(self.config.get("rpt_aug_inject_to_ce", True))
         self._alignment_warned = False
+        self._eval_use_target_stats: bool = False
+        self.dynamic_feature_sampling_cfg: Dict[str, Any] = {}
+        self.dynamic_feature_sampling_datamodule: Optional[EEGDataModuleCrossSubject] = None
 
     def _log_info(self, msg: str):
         if self.logger is not None:
@@ -1132,6 +1630,321 @@ class OptimizedTrainer:
         self.stage1_iahm_loss = None
         self.stage1_global_step = 0
 
+    def configure_dynamic_feature_sampling(
+        self,
+        *,
+        datamodule: EEGDataModuleCrossSubject,
+    ) -> None:
+        self.dynamic_feature_sampling_datamodule = datamodule
+        self.dynamic_feature_sampling_cfg = {
+            "enable": bool(self.config.get("dynamic_feature_sampling_enable", False)),
+            "warmup_epochs": int(self.config.get("dynamic_feature_sampling_warmup_epochs", 10)),
+            "refresh_every": int(self.config.get("dynamic_feature_sampling_refresh_every", 10)),
+            "source_support_size": int(self.config.get("dynamic_feature_sampling_source_support_size", 128)),
+            "target_support_size": int(self.config.get("dynamic_feature_sampling_target_support_size", 128)),
+            "seed": int(self.config.get("dynamic_feature_sampling_seed", self.config.get("random_seed", 2026))),
+            "metric": str(self.config.get("dynamic_feature_sampling_metric", "mmd")).strip().lower(),
+            "temperature": float(self.config.get("dynamic_feature_sampling_temperature", 1.0)),
+            "mix_alpha": float(self.config.get("dynamic_feature_sampling_mix_alpha", 0.2)),
+            "l2_normalize": bool(self.config.get("dynamic_feature_sampling_l2_normalize", True)),
+            "score_eps": float(self.config.get("dynamic_feature_sampling_score_eps", 1e-6)),
+            "mmd_sigma": float(self.config.get("dynamic_feature_sampling_mmd_sigma", 1.0)),
+            "batch_size": int(self.config.get("dynamic_feature_sampling_batch_size", 256)),
+            "score_ema_enable": bool(self.config.get("dynamic_feature_sampling_score_ema_enable", False)),
+            "score_ema_decay": float(self.config.get("dynamic_feature_sampling_score_ema_decay", 0.8)),
+        }
+
+    def _resolve_subject_batch_loader(self, train_loader):
+        if isinstance(train_loader, DualStreamDataLoader):
+            return train_loader.source_loader
+        return train_loader
+
+    def _dynamic_feature_sampling_active(self, train_loader) -> bool:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        if not bool(cfg.get("enable", False)):
+            return False
+        if self.dynamic_feature_sampling_datamodule is None:
+            return False
+        source_loader = self._resolve_subject_batch_loader(train_loader)
+        if not isinstance(source_loader, SubjectBatchDataLoader):
+            return False
+        info = dict(getattr(self.dynamic_feature_sampling_datamodule, "source_selection_info", {}) or {})
+        mode = str(info.get("mode", "")).strip().lower()
+        return mode == "all" and bool(getattr(source_loader, "random_subjects_each_step", False))
+
+    def _extract_feature_tensor(self, dataset) -> torch.Tensor:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        bs = max(1, int(cfg.get("batch_size", 256)))
+        l2_normalize = bool(cfg.get("l2_normalize", True))
+        loader = DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(self.device.type == "cuda"),
+        )
+        chunks: List[torch.Tensor] = []
+        was_training = bool(self.model.training)
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                x = batch[0] if isinstance(batch, (tuple, list)) else batch
+                x = x.to(self.device, non_blocking=True)
+                if len(x.shape) == 3:
+                    x = x.unsqueeze(1)
+                logits, extras = self._forward_unpack(x)
+                feat = self._select_hyperbolic_input(logits, extras).detach().float()
+                if l2_normalize:
+                    feat = F.normalize(feat, p=2, dim=1)
+                chunks.append(feat.cpu())
+        if was_training:
+            self.model.train()
+        if not chunks:
+            return torch.empty((0, 0), dtype=torch.float32)
+        return torch.cat(chunks, dim=0)
+
+    def _extract_labeled_features_and_labels(self, dataset) -> Tuple[torch.Tensor, torch.Tensor]:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        bs = max(1, int(cfg.get("batch_size", 256)))
+        l2_normalize = bool(cfg.get("l2_normalize", True))
+        loader = DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(self.device.type == "cuda"),
+        )
+        feat_chunks: List[torch.Tensor] = []
+        label_chunks: List[torch.Tensor] = []
+        was_training = bool(self.model.training)
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                    continue
+                x = batch[0].to(self.device, non_blocking=True)
+                y = batch[1].detach().to("cpu", dtype=torch.long)
+                if len(x.shape) == 3:
+                    x = x.unsqueeze(1)
+                logits, extras = self._forward_unpack(x)
+                feat = self._select_hyperbolic_input(logits, extras).detach().float()
+                if l2_normalize:
+                    feat = F.normalize(feat, p=2, dim=1)
+                feat_chunks.append(feat.cpu())
+                label_chunks.append(y)
+        if was_training:
+            self.model.train()
+        if not feat_chunks:
+            return torch.empty((0, 0), dtype=torch.float32), torch.empty((0,), dtype=torch.long)
+        return torch.cat(feat_chunks, dim=0), torch.cat(label_chunks, dim=0)
+
+    def _extract_target_support_features_and_probs(
+        self,
+        dataset,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        bs = max(1, int(cfg.get("batch_size", 256)))
+        l2_normalize = bool(cfg.get("l2_normalize", True))
+        pos_label = int(self.config.get("rpcs_positive_label", 1))
+        bg_label = int(self.config.get("rpcs_background_label", 0))
+        use_confidence_weight = bool(cfg.get("use_confidence_weight", True))
+        loader = DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(self.device.type == "cuda"),
+        )
+        feat_chunks: List[torch.Tensor] = []
+        pos_chunks: List[torch.Tensor] = []
+        bg_chunks: List[torch.Tensor] = []
+        was_training = bool(self.model.training)
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                x = batch[0] if isinstance(batch, (tuple, list)) else batch
+                x = x.to(self.device, non_blocking=True)
+                if len(x.shape) == 3:
+                    x = x.unsqueeze(1)
+                logits, extras = self._forward_unpack(x)
+                feat = self._select_hyperbolic_input(logits, extras).detach().float()
+                if l2_normalize:
+                    feat = F.normalize(feat, p=2, dim=1)
+                prob = torch.softmax(logits.detach().float(), dim=1)
+                p_pos = prob[:, pos_label]
+                p_bg = prob[:, bg_label]
+                if use_confidence_weight:
+                    conf = torch.abs(p_pos - p_bg)
+                    p_pos = p_pos * conf
+                    p_bg = p_bg * conf
+                feat_chunks.append(feat.cpu())
+                pos_chunks.append(p_pos.detach().cpu())
+                bg_chunks.append(p_bg.detach().cpu())
+        if was_training:
+            self.model.train()
+        if not feat_chunks:
+            return (
+                torch.empty((0, 0), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.float32),
+            )
+        return (
+            torch.cat(feat_chunks, dim=0),
+            torch.cat(pos_chunks, dim=0),
+            torch.cat(bg_chunks, dim=0),
+        )
+
+    def _pair_similarity_score(self, source_feat: torch.Tensor, target_feat: torch.Tensor) -> float:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        metric = str(cfg.get("metric", "mmd")).strip().lower()
+        score_eps = float(cfg.get("score_eps", 1e-6))
+        if source_feat.numel() == 0 or target_feat.numel() == 0:
+            return 0.0
+
+        x = source_feat.to(self.device, dtype=torch.float32)
+        y = target_feat.to(self.device, dtype=torch.float32)
+
+        if metric == "mmd":
+            sigma = float(cfg.get("mmd_sigma", 1.0))
+            dist = float(self._mmd_rbf(x, y, sigma=sigma).detach().item())
+            return 1.0 / max(dist + score_eps, score_eps)
+        if metric == "mean_cosine":
+            mx = x.mean(dim=0, keepdim=True)
+            my = y.mean(dim=0, keepdim=True)
+            sim = F.cosine_similarity(mx, my, dim=1)
+            return float(torch.clamp(sim, min=0.0).detach().item()) + score_eps
+        if metric == "mean_euclidean":
+            mx = x.mean(dim=0)
+            my = y.mean(dim=0)
+            dist = float(torch.norm(mx - my, p=2).detach().item())
+            return 1.0 / max(dist + score_eps, score_eps)
+        raise ValueError(f"Unsupported dynamic_feature_sampling_metric: {metric}")
+
+    def _soft_class_mmd_score(
+        self,
+        *,
+        source_feat: torch.Tensor,
+        source_labels: torch.Tensor,
+        target_feat: torch.Tensor,
+        target_pos_weights: torch.Tensor,
+        target_bg_weights: torch.Tensor,
+    ) -> float:
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        pos_label = int(self.config.get("rpcs_positive_label", 1))
+        bg_label = int(self.config.get("rpcs_background_label", 0))
+        pos_weight = float(cfg.get("pos_weight", 0.7))
+        pos_weight = float(np.clip(pos_weight, 0.0, 1.0))
+        bg_weight = 1.0 - pos_weight
+        sigma = float(cfg.get("mmd_sigma", 1.0))
+        score_eps = float(cfg.get("score_eps", 1e-6))
+        min_class_samples = max(1, int(cfg.get("min_class_samples", 8)))
+
+        if source_feat.numel() == 0 or target_feat.numel() == 0 or source_labels.numel() == 0:
+            return 0.0
+
+        src_feat = source_feat.to(self.device, dtype=torch.float32)
+        src_labels = source_labels.to(self.device, dtype=torch.long)
+        tgt_feat = target_feat.to(self.device, dtype=torch.float32)
+        w_pos = target_pos_weights.to(self.device, dtype=torch.float32)
+        w_bg = target_bg_weights.to(self.device, dtype=torch.float32)
+
+        src_pos = src_feat[src_labels == pos_label]
+        src_bg = src_feat[src_labels == bg_label]
+        if int(src_pos.shape[0]) < min_class_samples or int(src_bg.shape[0]) < min_class_samples:
+            return 0.0
+
+        d_pos = self._mmd_rbf(src_pos, tgt_feat, y_weights=w_pos, sigma=sigma)
+        d_bg = self._mmd_rbf(src_bg, tgt_feat, y_weights=w_bg, sigma=sigma)
+        s_pos = 1.0 / max(float(d_pos.detach().item()) + score_eps, score_eps)
+        s_bg = 1.0 / max(float(d_bg.detach().item()) + score_eps, score_eps)
+        return pos_weight * s_pos + bg_weight * s_bg
+
+    def _refresh_dynamic_feature_sampling_scores(self, train_loader) -> None:
+        if not self._dynamic_feature_sampling_active(train_loader):
+            return
+
+        cfg = dict(self.dynamic_feature_sampling_cfg or {})
+        source_loader = self._resolve_subject_batch_loader(train_loader)
+        source_loader.subject_sampling_mix_alpha = float(np.clip(cfg.get("mix_alpha", 0.2), 0.0, 1.0))
+
+        warmup_epochs = max(0, int(cfg.get("warmup_epochs", 10)))
+        refresh_every = max(1, int(cfg.get("refresh_every", 10)))
+        epoch = int(self.current_epoch)
+
+        if epoch <= warmup_epochs:
+            source_loader.subject_sampling_weights = {}
+            if self.dynamic_feature_sampling_datamodule is not None:
+                self.dynamic_feature_sampling_datamodule.clear_dynamic_source_scores()
+            return
+
+        should_refresh = (epoch == warmup_epochs + 1) or ((epoch - (warmup_epochs + 1)) % refresh_every == 0)
+        if not should_refresh:
+            return
+
+        dm = self.dynamic_feature_sampling_datamodule
+        assert dm is not None
+        source_support_map = dm.get_dynamic_feature_source_support_datasets(
+            max_samples_per_subject=int(cfg.get("source_support_size", 128)),
+            seed=int(cfg.get("seed", self.config.get("random_seed", 2026))),
+        )
+        target_support = dm.get_dynamic_feature_target_support_dataset(
+            max_samples=int(cfg.get("target_support_size", 128)),
+            seed=int(cfg.get("seed", self.config.get("random_seed", 2026))),
+        )
+        metric = str(cfg.get("metric", "mmd")).strip().lower()
+        if metric == "soft_class_mmd":
+            target_feat, target_pos_w, target_bg_w = self._extract_target_support_features_and_probs(target_support)
+        else:
+            target_feat = self._extract_feature_tensor(target_support)
+        raw_scores: Dict[str, float] = {}
+        for skey, ds in source_support_map.items():
+            if metric == "soft_class_mmd":
+                source_feat, source_labels = self._extract_labeled_features_and_labels(ds)
+                raw_scores[str(skey)] = float(
+                    self._soft_class_mmd_score(
+                        source_feat=source_feat,
+                        source_labels=source_labels,
+                        target_feat=target_feat,
+                        target_pos_weights=target_pos_w,
+                        target_bg_weights=target_bg_w,
+                    )
+                )
+            else:
+                source_feat = self._extract_feature_tensor(ds)
+                raw_scores[str(skey)] = float(self._pair_similarity_score(source_feat, target_feat))
+
+        score_eps = float(cfg.get("score_eps", 1e-6))
+        temp = max(float(cfg.get("temperature", 1.0)), 1e-6)
+        score_keys = list(raw_scores.keys())
+        score_arr = np.asarray([max(float(raw_scores[k]), score_eps) for k in score_keys], dtype=np.float64)
+        logits = np.log(score_arr + score_eps) / temp
+        logits = logits - float(np.max(logits))
+        weight_arr = np.exp(logits)
+        if not np.isfinite(weight_arr).all() or float(np.sum(weight_arr)) <= 0.0:
+            weight_arr = np.ones_like(weight_arr)
+        score_map = {k: float(v) for k, v in zip(score_keys, weight_arr.tolist())}
+
+        ema_enable = bool(cfg.get("score_ema_enable", False))
+        ema_decay = float(np.clip(cfg.get("score_ema_decay", 0.8), 0.0, 0.999))
+        prev_score_map = dict(getattr(dm, "_dynamic_source_scores", {}) or {})
+        if ema_enable and prev_score_map:
+            ema_map: Dict[str, float] = {}
+            for k in score_keys:
+                prev_v = float(prev_score_map.get(k, 0.0))
+                cur_v = float(score_map.get(k, 0.0))
+                ema_map[k] = ema_decay * prev_v + (1.0 - ema_decay) * cur_v
+            score_map = ema_map
+
+        source_loader.subject_sampling_weights = dict(score_map)
+        dm.set_dynamic_source_scores(score_map)
+        top5 = sorted(((k, raw_scores[k]) for k in raw_scores.keys()), key=lambda kv: kv[1], reverse=True)[:5]
+        preview = ", ".join([f"{k}:{v:.4f}" for k, v in top5])
+        self._log_info(
+            f"[DYN-SAMPLING] epoch={epoch:03d} metric={cfg.get('metric', 'mmd')} "
+            f"updated {len(score_map)} source scores"
+            f"{' | ema=true' if ema_enable else ''} | top-5 raw: {preview}"
+        )
+
     def fit(self, train_loader, val_loader, stage: int, epochs: int):
         patience = int(self.config.get("patience", 20))
         early_stop_start_epoch = int(self.config.get("early_stop_start_epoch", 0))
@@ -1141,6 +1954,7 @@ class OptimizedTrainer:
 
         for epoch in range(1, epochs + 1):
             self.current_epoch = epoch
+            self._refresh_dynamic_feature_sampling_scores(train_loader)
             with MemoryManager.cuda_memory_context():
                 train_metrics = self._run_epoch(
                     train_loader,
@@ -1202,13 +2016,63 @@ class OptimizedTrainer:
 
 
     def _stage1_has_aux(self) -> bool:
-        has_rpt = self.stage1_rpt_augmentor is not None
         has_iahm = bool(self.stage1_iahm_cfg.get("enable", False))
         has_align = float(self.lambda_align) > 0.0
-        return has_rpt or has_iahm or has_align
+        has_class_align = float(self.lambda_class_align) > 0.0
+        has_ccl = float(self.lambda_ccl) > 0.0
+        has_prior = float(self.lambda_prior) > 0.0
+        has_lsa_content = float(self.lsa_content_lambda) > 0.0
+        has_lsa_identity = float(self.lsa_identity_lambda) > 0.0
+        return has_iahm or has_align or has_class_align or has_ccl or has_prior or has_lsa_content or has_lsa_identity
 
     def _zero_tensor(self) -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32, device=self.device)
+
+    def _current_class_align_lambda(self) -> float:
+        lam = float(self.lambda_class_align)
+        if lam <= 0.0:
+            return 0.0
+        epoch = int(self.current_epoch)
+        start = max(0, int(self.class_align_start_epoch))
+        if epoch < start:
+            return 0.0
+        return lam
+
+    def _current_ccl_lambda(self) -> float:
+        lam = float(self.lambda_ccl)
+        if lam <= 0.0:
+            return 0.0
+        epoch = int(self.current_epoch)
+        start = max(0, int(self.ccl_start_epoch))
+        if epoch < start:
+            return 0.0
+        return lam
+
+    def _current_prior_lambda(self) -> float:
+        lam = float(self.lambda_prior)
+        if lam <= 0.0:
+            return 0.0
+        epoch = int(self.current_epoch)
+        start = max(0, int(self.prior_start_epoch))
+        if epoch < start:
+            return 0.0
+        return lam
+
+    def _prior_interval_loss(self, logits_t: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        if logits_t is None or logits_t.numel() == 0:
+            return self._zero_tensor(), float("nan")
+        pos_label = int(self.stage1_positive_label)
+        probs_t = torch.softmax(logits_t.float(), dim=1)
+        mean_pos_prob = torch.mean(probs_t[:, pos_label])
+        prior_min = float(min(self.prior_min, self.prior_max))
+        prior_max = float(max(self.prior_min, self.prior_max))
+        deficit = torch.relu(torch.as_tensor(prior_min, dtype=mean_pos_prob.dtype, device=mean_pos_prob.device) - mean_pos_prob)
+        excess = torch.relu(mean_pos_prob - torch.as_tensor(prior_max, dtype=mean_pos_prob.dtype, device=mean_pos_prob.device))
+        if self.prior_loss_type == "l1":
+            loss = deficit + excess
+        else:
+            loss = deficit.pow(2) + excess.pow(2)
+        return loss, float(mean_pos_prob.detach().item())
 
     def _ensure_iahm_loss(self, embed_dim: int) -> Optional[IAHMLoss]:
         cfg = dict(self.stage1_iahm_cfg or {})
@@ -1224,10 +2088,10 @@ class OptimizedTrainer:
         else:
             class_counts = list(class_counts[:n_classes])
 
-        self.stage1_iahm_loss = IAHMLoss(
+        space = str(cfg.get("space", "hyperbolic")).strip().lower()
+        init_kwargs = dict(
             n_classes=n_classes,
             embed_dim=int(embed_dim),
-            curvature=float(cfg.get("curvature", -1.0)),
             class_counts=class_counts,
             r0=float(cfg.get("r0", 1.0)),
             gamma=float(cfg.get("gamma", 1.0)),
@@ -1237,11 +2101,17 @@ class OptimizedTrainer:
             lambda_c=float(cfg.get("lambda_c", 0.5)),
             lambda_m=float(cfg.get("lambda_m", 1.0)),
             centroid_momentum=float(cfg.get("centroid_momentum", 0.1)),
-        ).to(self.device)
+        )
+        if space == "hyperbolic":
+            init_kwargs["curvature"] = float(cfg.get("curvature", -1.0))
+            self.stage1_iahm_loss = IAHMLoss(**init_kwargs).to(self.device)
+        else:
+            self.stage1_iahm_loss = EuclideanIAHMLoss(**init_kwargs).to(self.device)
         self._log_info(
             "IAHM initialized | "
             f"embed_dim={embed_dim} | "
             f"class_counts={class_counts} | "
+            f"space={space} | "
             f"curvature={cfg.get('curvature', -1.0)}"
         )
         return self.stage1_iahm_loss
@@ -1285,13 +2155,289 @@ class OptimizedTrainer:
             term_yy = torch.sum(k_yy * (w.unsqueeze(1) * w.unsqueeze(0)))
         return term_xx + term_yy - 2.0 * term_xy
 
+    def _coral_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if x is None or y is None or x.numel() == 0 or y.numel() == 0:
+            return self._zero_tensor()
+        if x.ndim != 2 or y.ndim != 2:
+            return self._zero_tensor()
+        if x.shape[1] != y.shape[1]:
+            return self._zero_tensor()
+
+        def _cov(a: torch.Tensor) -> torch.Tensor:
+            n = int(a.shape[0])
+            d = int(a.shape[1])
+            if n <= 1:
+                return torch.eye(d, device=a.device, dtype=a.dtype)
+            mean = torch.mean(a, dim=0, keepdim=True)
+            centered = a - mean
+            cov = (centered.T @ centered) / float(max(n - 1, 1))
+            cov = cov + float(eps) * torch.eye(d, device=a.device, dtype=a.dtype)
+            return cov
+
+        cov_x = _cov(x)
+        cov_y = _cov(y)
+        d = int(x.shape[1])
+        return torch.sum((cov_x - cov_y) ** 2) / float(4 * d * d)
+
+    def _uot_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        eps: Optional[float] = None,
+        tau_source: Optional[float] = None,
+        tau_target: Optional[float] = None,
+        max_iter: Optional[int] = None,
+    ) -> torch.Tensor:
+        if x is None or y is None or x.numel() == 0 or y.numel() == 0:
+            return self._zero_tensor()
+        if x.ndim != 2 or y.ndim != 2 or int(x.shape[1]) != int(y.shape[1]):
+            return self._zero_tensor()
+
+        x = x.float()
+        y = y.float()
+        n = int(x.shape[0])
+        m = int(y.shape[0])
+        if n == 0 or m == 0:
+            return self._zero_tensor()
+
+        # Keep the transport geometry bounded; without this, batch feature
+        # scales can make the unbalanced Sinkhorn updates blow up early.
+        x = F.normalize(x, dim=1)
+        y = F.normalize(y, dim=1)
+
+        eps_val = float(self.uot_eps if eps is None else eps)
+        tau_s = float(self.uot_tau_source if tau_source is None else tau_source)
+        tau_t = float(self.uot_tau_target if tau_target is None else tau_target)
+        n_iter = int(self.uot_max_iter if max_iter is None else max_iter)
+        eps_val = max(eps_val, 1.0e-6)
+        tau_s = max(tau_s, 1.0e-6)
+        tau_t = max(tau_t, 1.0e-6)
+        n_iter = max(n_iter, 1)
+        tiny = 1.0e-8
+
+        x_norm = torch.sum(x * x, dim=1, keepdim=True)
+        y_norm = torch.sum(y * y, dim=1, keepdim=True)
+        cost = torch.clamp(x_norm + y_norm.T - 2.0 * (x @ y.T), min=0.0)
+        cost = cost / float(max(int(x.shape[1]), 1))
+
+        a = torch.full((n,), 1.0 / float(n), device=x.device, dtype=x.dtype)
+        b = torch.full((m,), 1.0 / float(m), device=y.device, dtype=y.dtype)
+
+        kernel = torch.exp(-cost / eps_val).clamp_min(tiny)
+        u = torch.ones_like(a)
+        v = torch.ones_like(b)
+        p_s = tau_s / (tau_s + eps_val)
+        p_t = tau_t / (tau_t + eps_val)
+
+        for _ in range(n_iter):
+            kv = torch.clamp(kernel @ v, min=tiny)
+            ratio_u = torch.clamp(a / kv, min=tiny, max=1.0e6)
+            u = torch.pow(ratio_u, p_s).clamp(min=tiny, max=1.0e6)
+            ktu = torch.clamp(kernel.T @ u, min=tiny)
+            ratio_v = torch.clamp(b / ktu, min=tiny, max=1.0e6)
+            v = torch.pow(ratio_v, p_t).clamp(min=tiny, max=1.0e6)
+
+        gamma = ((u.unsqueeze(1) * kernel) * v.unsqueeze(0)).clamp(min=tiny, max=1.0e6)
+        row_mass = torch.clamp(gamma.sum(dim=1), min=tiny)
+        col_mass = torch.clamp(gamma.sum(dim=0), min=tiny)
+
+        transport_cost = torch.sum(gamma * cost)
+        kl_row = torch.sum(row_mass * (torch.log(row_mass) - torch.log(a)) - row_mass + a)
+        kl_col = torch.sum(col_mass * (torch.log(col_mass) - torch.log(b)) - col_mass + b)
+        return transport_cost + tau_s * kl_row + tau_t * kl_col
+
+    def _pairwise_similarity_preservation_loss(
+        self,
+        feat_before: Optional[torch.Tensor],
+        feat_after: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            feat_before is None
+            or feat_after is None
+            or feat_before.numel() == 0
+            or feat_after.numel() == 0
+            or feat_before.ndim != 2
+            or feat_after.ndim != 2
+            or feat_before.shape != feat_after.shape
+            or int(feat_before.shape[0]) <= 1
+        ):
+            return self._zero_tensor()
+
+        fb = F.normalize(feat_before.float(), dim=1)
+        fa = F.normalize(feat_after.float(), dim=1)
+        sim_before = fb @ fb.T
+        sim_after = fa @ fa.T
+        return F.mse_loss(sim_after, sim_before.detach())
+
+    def _feature_identity_loss(
+        self,
+        feat_before: Optional[torch.Tensor],
+        feat_after: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            feat_before is None
+            or feat_after is None
+            or feat_before.numel() == 0
+            or feat_after.numel() == 0
+            or feat_before.shape != feat_after.shape
+        ):
+            return self._zero_tensor()
+        return F.mse_loss(feat_after.float(), feat_before.detach().float())
+
+    def _lmmd_loss(
+        self,
+        source_feat: torch.Tensor,
+        target_feat: torch.Tensor,
+        source_labels: torch.Tensor,
+        target_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        if (
+            source_feat is None
+            or target_feat is None
+            or source_labels is None
+            or target_probs is None
+            or source_feat.numel() == 0
+            or target_feat.numel() == 0
+            or source_labels.numel() == 0
+            or target_probs.numel() == 0
+        ):
+            return self._zero_tensor()
+        if source_feat.ndim != 2 or target_feat.ndim != 2 or target_probs.ndim != 2:
+            return self._zero_tensor()
+        if source_feat.shape[1] != target_feat.shape[1]:
+            return self._zero_tensor()
+
+        n_classes = int(self.config.get("n_class", target_probs.shape[1]))
+        if int(target_probs.shape[1]) != n_classes:
+            return self._zero_tensor()
+
+        total = torch.cat([source_feat, target_feat], dim=0)
+        total_norm = torch.sum(total * total, dim=1, keepdim=True)
+        dist2 = torch.clamp(total_norm + total_norm.T - 2.0 * (total @ total.T), min=0.0)
+
+        fix_sigma = self.lmmd_fix_sigma
+        if fix_sigma in (None, "", "None", "none", "null", "NULL"):
+            n_total = int(total.shape[0])
+            denom = max(n_total * n_total - n_total, 1)
+            bandwidth = torch.sum(dist2.detach()) / float(denom)
+        else:
+            bandwidth = torch.as_tensor(float(fix_sigma), device=total.device, dtype=total.dtype)
+        bandwidth = torch.clamp(bandwidth, min=1.0e-6)
+        bandwidth = bandwidth / float(self.lmmd_kernel_mul ** (self.lmmd_kernel_num // 2))
+
+        kernels = torch.zeros_like(dist2)
+        for i in range(max(1, int(self.lmmd_kernel_num))):
+            bw = torch.clamp(
+                bandwidth * float(self.lmmd_kernel_mul ** i),
+                min=1.0e-6,
+            )
+            kernels = kernels + torch.exp(-dist2 / bw)
+
+        ns = int(source_feat.shape[0])
+        k_ss = kernels[:ns, :ns]
+        k_tt = kernels[ns:, ns:]
+        k_st = kernels[:ns, ns:]
+
+        source_onehot = F.one_hot(source_labels.long(), num_classes=n_classes).float()
+        source_weights = source_onehot / torch.clamp(source_onehot.sum(dim=0, keepdim=True), min=1.0)
+
+        if bool(self.lmmd_use_soft_target):
+            target_weights = target_probs.float()
+        else:
+            target_hard = torch.argmax(target_probs, dim=1)
+            target_weights = F.one_hot(target_hard.long(), num_classes=n_classes).float()
+        target_weights = target_weights / torch.clamp(target_weights.sum(dim=0, keepdim=True), min=1.0)
+
+        loss = self._zero_tensor()
+        for k in range(n_classes):
+            ws = source_weights[:, k]
+            wt = target_weights[:, k]
+            if float(ws.sum().detach().item()) <= 0.0 or float(wt.sum().detach().item()) <= 0.0:
+                continue
+            w_ss = ws.unsqueeze(1) * ws.unsqueeze(0)
+            w_tt = wt.unsqueeze(1) * wt.unsqueeze(0)
+            w_st = ws.unsqueeze(1) * wt.unsqueeze(0)
+            loss = loss + torch.sum(w_ss * k_ss) + torch.sum(w_tt * k_tt) - 2.0 * torch.sum(w_st * k_st)
+        return loss / float(max(1, n_classes))
+
+    def _ccl_loss(
+        self,
+        target_probs: torch.Tensor,
+        eps: float = 1.0e-8,
+    ) -> torch.Tensor:
+        if target_probs is None or target_probs.numel() == 0 or target_probs.ndim != 2:
+            return self._zero_tensor()
+        batch_size = int(target_probs.shape[0])
+        n_classes = int(target_probs.shape[1])
+        if batch_size <= 0 or n_classes <= 0:
+            return self._zero_tensor()
+
+        probs = torch.clamp(target_probs.float(), min=float(eps), max=1.0)
+        entropy = -torch.sum(probs * torch.log(probs), dim=1)
+        weights = 1.0 + torch.exp(-entropy)
+        weights = float(batch_size) * weights / torch.clamp(torch.sum(weights), min=float(eps))
+        weighted_probs = probs * weights.unsqueeze(1)
+        ccm = probs.T @ weighted_probs
+        ccm = ccm / torch.clamp(ccm.sum(dim=1, keepdim=True), min=float(eps))
+        return (torch.sum(ccm) - torch.trace(ccm)) / float(max(1, n_classes))
+
+    def _sample_rpt_batch(
+        self,
+        *,
+        source_labels: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.stage1_rpt_augmentor is None:
+            return None, None, None
+
+        n_cfg = self.rpt_synth_per_batch_cfg
+        if n_cfg in (None, "", "None", "none", "null", "NULL"):
+            n_pos = int((source_labels == int(self.stage1_positive_label)).sum().detach().item())
+            n_synth = max(1, n_pos)
+        else:
+            n_synth = max(1, int(n_cfg))
+
+        synth = self.stage1_rpt_augmentor.sample(
+            n=int(n_synth),
+            seed=int(self.current_epoch * 100000 + self.stage1_global_step),
+        )
+        x_rpt_np = np.asarray(synth.get("trials", np.empty((0,))), dtype=np.float32)
+        if x_rpt_np.ndim != 3 or int(x_rpt_np.shape[0]) <= 0:
+            return None, None, None
+
+        x_rpt = torch.from_numpy(x_rpt_np).to(self.device)
+        if len(x_rpt.shape) == 3:
+            x_rpt = x_rpt.unsqueeze(1)
+        if not torch.isfinite(x_rpt).all():
+            return None, None, None
+        y_np = np.asarray(
+            synth.get(
+                "labels",
+                np.full((int(x_rpt_np.shape[0]),), int(self.stage1_positive_label), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        )
+        y_rpt = torch.from_numpy(y_np).to(self.device, dtype=torch.long)
+        w_np = np.asarray(synth.get("weights", np.ones((x_rpt_np.shape[0],))), dtype=np.float32)
+        w_rpt = torch.from_numpy(w_np).to(self.device)
+        return x_rpt, y_rpt, w_rpt
+
     def _stage1_aux_losses(
         self,
         *,
         source_embed: torch.Tensor,
         source_labels: torch.Tensor,
+        source_domain_id: Optional[torch.Tensor],
         target_x: Optional[torch.Tensor],
         training: bool,
+        synth_embed: Optional[torch.Tensor] = None,
+        synth_labels: Optional[torch.Tensor] = None,
+        synth_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, OrderedDict]:
         """
         Optional Stage-1 auxiliary losses:
@@ -1302,82 +2448,162 @@ class OptimizedTrainer:
             return self._zero_tensor(), OrderedDict()
 
         aux_items = OrderedDict()
-        curv = float((self.stage1_iahm_cfg or {}).get("curvature", -1.0))
-        z_src = euclidean_to_lorentz(source_embed.float(), K=curv)
+        iahm_cfg = dict(self.stage1_iahm_cfg or {})
+        curv = float(iahm_cfg.get("curvature", -1.0))
+        space = str(iahm_cfg.get("space", "hyperbolic")).strip().lower()
+        normalize_mode = str(iahm_cfg.get("input_normalize", "none")).strip().lower()
+
+        def _prep_iahm_input(x: torch.Tensor) -> torch.Tensor:
+            x = x.float()
+            if normalize_mode == "l2":
+                x = F.normalize(x, p=2, dim=1)
+            if space == "hyperbolic":
+                return euclidean_to_lorentz(x, K=curv)
+            return x
+
+        z_src = _prep_iahm_input(source_embed)
 
         # Target embeddings for negative/background alignment branch.
         z_tgt = None
+        target_logits = None
+        target_probs = None
+        target_content_pre = None
+        target_content_post = None
         if target_x is not None:
             if len(target_x.shape) == 3:
                 target_x = target_x.unsqueeze(1)
+            self._set_model_domain_context(domain_ids=None, use_target_stats=True)
             target_logits, target_extras = self._forward_unpack(target_x)
             target_embed = self._select_hyperbolic_input(target_logits, target_extras)
-            z_tgt = euclidean_to_lorentz(target_embed.float(), K=curv)
+            z_tgt = _prep_iahm_input(target_embed)
+            target_probs = torch.softmax(target_logits.float(), dim=1)
+            if isinstance(target_extras, dict):
+                target_content_pre = target_extras.get("lsa_content_pre", None)
+                target_content_post = target_extras.get("lsa_content_post", None)
 
-        z_rpt = None
-        w_rpt = None
-        if self.stage1_rpt_augmentor is not None:
-            n_cfg = self.rpt_synth_per_batch_cfg
-            if n_cfg in (None, "", "None", "none", "null", "NULL"):
-                n_pos = int((source_labels == int(self.stage1_positive_label)).sum().detach().item())
-                n_synth = max(1, n_pos)
-            else:
-                n_synth = max(1, int(n_cfg))
-            synth = self.stage1_rpt_augmentor.sample(
-                n=int(n_synth),
-                seed=int(self.current_epoch * 100000 + self.stage1_global_step),
-            )
-            x_rpt_np = np.asarray(synth.get("trials", np.empty((0,))), dtype=np.float32)
-            if x_rpt_np.ndim == 3 and int(x_rpt_np.shape[0]) > 0:
-                x_rpt = torch.from_numpy(x_rpt_np).to(self.device)
-                if len(x_rpt.shape) == 3:
-                    x_rpt = x_rpt.unsqueeze(1)
-                synth_logits, synth_extras = self._forward_unpack(x_rpt)
-                synth_embed = self._select_hyperbolic_input(synth_logits, synth_extras)
-                z_rpt = euclidean_to_lorentz(synth_embed.float(), K=curv)
-                w = np.asarray(synth.get("weights", np.ones((x_rpt_np.shape[0],))), dtype=np.float32)
-                w_rpt = torch.from_numpy(w).to(self.device)
+        z_rpt = _prep_iahm_input(synth_embed) if synth_embed is not None and synth_embed.numel() > 0 else None
+        w_rpt = synth_weights
 
-        # Alignment loss (class-conditional)
+        # Alignment loss
         loss_align = self._zero_tensor()
         if float(self.lambda_align) > 0.0:
-            if self.alignment_loss_name not in ("mmd",):
+            if self.alignment_loss_name not in ("mmd", "lmmd", "global_mmd", "per_subject_mmd", "global_coral", "per_subject_coral", "uot"):
                 if not self._alignment_warned:
                     self._log_info(
                         f"Unsupported alignment_loss={self.alignment_loss_name}, fallback to mmd."
                     )
                     self._alignment_warned = True
-            pos_mask = (source_labels == int(self.stage1_positive_label))
-            neg_mask = (source_labels == int(self.stage1_background_label))
-            z_s_pos = z_src[pos_mask]
-            z_s_neg = z_src[neg_mask]
+            if self.alignment_loss_name == "lmmd":
+                if (
+                    z_tgt is not None
+                    and z_tgt.numel() > 0
+                    and z_src.numel() > 0
+                    and target_probs is not None
+                    and target_probs.numel() > 0
+                ):
+                    loss_align = self._lmmd_loss(
+                        source_feat=z_src,
+                        target_feat=z_tgt,
+                        source_labels=source_labels,
+                        target_probs=target_probs,
+                    )
+                aux_items["align_lmmd"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            elif self.alignment_loss_name == "global_mmd":
+                if z_tgt is not None and z_tgt.numel() > 0 and z_src.numel() > 0:
+                    loss_align = self._mmd_rbf(z_src, z_tgt, y_weights=None)
+                aux_items["align_global"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            elif self.alignment_loss_name == "global_coral":
+                if z_tgt is not None and z_tgt.numel() > 0 and z_src.numel() > 0:
+                    loss_align = self._coral_loss(z_src, z_tgt)
+                aux_items["align_global_coral"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            elif self.alignment_loss_name == "uot":
+                if z_tgt is not None and z_tgt.numel() > 0 and z_src.numel() > 0:
+                    loss_align = self._uot_loss(z_src, z_tgt)
+                aux_items["align_uot"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            elif self.alignment_loss_name == "per_subject_mmd":
+                if (
+                    z_tgt is not None
+                    and z_tgt.numel() > 0
+                    and z_src.numel() > 0
+                    and source_domain_id is not None
+                    and source_domain_id.numel() == z_src.shape[0]
+                ):
+                    unique_ids = torch.unique(source_domain_id.detach())
+                    losses = []
+                    for domain_id in unique_ids:
+                        mask = (source_domain_id == domain_id)
+                        z_src_k = z_src[mask]
+                        if z_src_k.numel() == 0:
+                            continue
+                        losses.append(self._mmd_rbf(z_src_k, z_tgt, y_weights=None))
+                    if losses:
+                        loss_align = torch.stack(losses).mean()
+                        aux_items["align_n_domains"] = float(len(losses))
+                    else:
+                        loss_align = self._zero_tensor()
+                elif z_tgt is not None and z_tgt.numel() > 0 and z_src.numel() > 0:
+                    # Fallback when domain ids are unavailable.
+                    loss_align = self._mmd_rbf(z_src, z_tgt, y_weights=None)
+                    aux_items["align_fallback_global"] = 1.0
+                aux_items["align_per_subject"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            elif self.alignment_loss_name == "per_subject_coral":
+                if (
+                    z_tgt is not None
+                    and z_tgt.numel() > 0
+                    and z_src.numel() > 0
+                    and source_domain_id is not None
+                    and source_domain_id.numel() == z_src.shape[0]
+                ):
+                    unique_ids = torch.unique(source_domain_id.detach())
+                    losses = []
+                    for domain_id in unique_ids:
+                        mask = (source_domain_id == domain_id)
+                        z_src_k = z_src[mask]
+                        if z_src_k.numel() == 0:
+                            continue
+                        losses.append(self._coral_loss(z_src_k, z_tgt))
+                    if losses:
+                        loss_align = torch.stack(losses).mean()
+                        aux_items["align_n_domains"] = float(len(losses))
+                    else:
+                        loss_align = self._zero_tensor()
+                elif z_tgt is not None and z_tgt.numel() > 0 and z_src.numel() > 0:
+                    loss_align = self._coral_loss(z_src, z_tgt)
+                    aux_items["align_fallback_global"] = 1.0
+                aux_items["align_per_subject_coral"] = float(loss_align.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
+            else:
+                pos_mask = (source_labels == int(self.stage1_positive_label))
+                neg_mask = (source_labels == int(self.stage1_background_label))
+                z_s_pos = z_src[pos_mask]
+                z_s_neg = z_src[neg_mask]
 
-            loss_align_pos = self._zero_tensor()
-            if z_rpt is not None and z_rpt.numel() > 0 and z_s_pos.numel() > 0:
-                loss_align_pos = self._mmd_rbf(z_s_pos, z_rpt, y_weights=w_rpt)
+                loss_align_pos = self._zero_tensor()
+                if z_rpt is not None and z_rpt.numel() > 0 and z_s_pos.numel() > 0:
+                    loss_align_pos = self._mmd_rbf(z_s_pos, z_rpt, y_weights=w_rpt)
 
-            loss_align_neg = self._zero_tensor()
-            if z_tgt is not None and z_tgt.numel() > 0 and z_s_neg.numel() > 0:
-                loss_align_neg = self._mmd_rbf(z_s_neg, z_tgt, y_weights=None)
+                loss_align_neg = self._zero_tensor()
+                if z_tgt is not None and z_tgt.numel() > 0 and z_s_neg.numel() > 0:
+                    loss_align_neg = self._mmd_rbf(z_s_neg, z_tgt, y_weights=None)
 
-            loss_align = loss_align_pos + loss_align_neg
-            aux_items["align_pos"] = float(loss_align_pos.detach().item())
-            aux_items["align_neg"] = float(loss_align_neg.detach().item())
-            aux_items["align"] = float(loss_align.detach().item())
+                loss_align = loss_align_pos + loss_align_neg
+                aux_items["align_pos"] = float(loss_align_pos.detach().item())
+                aux_items["align_neg"] = float(loss_align_neg.detach().item())
+                aux_items["align"] = float(loss_align.detach().item())
 
         # IAHM loss (source + synthetic positive)
         loss_iahm = self._zero_tensor()
-        iahm_fn = self._ensure_iahm_loss(embed_dim=int(z_src.shape[1] - 1))
+        iahm_embed_dim = int(source_embed.shape[1])
+        iahm_fn = self._ensure_iahm_loss(embed_dim=iahm_embed_dim)
         if iahm_fn is not None:
-            if z_rpt is not None and z_rpt.numel() > 0:
-                y_rpt = torch.full(
-                    (int(z_rpt.shape[0]),),
-                    int(self.stage1_positive_label),
-                    dtype=torch.long,
-                    device=self.device,
-                )
+            if z_rpt is not None and z_rpt.numel() > 0 and synth_labels is not None:
                 z_all = torch.cat([z_src, z_rpt], dim=0)
-                y_all = torch.cat([source_labels.long(), y_rpt], dim=0)
+                y_all = torch.cat([source_labels.long(), synth_labels.long()], dim=0)
             else:
                 z_all = z_src
                 y_all = source_labels.long()
@@ -1386,8 +2612,97 @@ class OptimizedTrainer:
             for k, v in iahm_items.items():
                 aux_items[f"iahm_{k}"] = float(v)
 
+        loss_class_align = self._zero_tensor()
+        lambda_class_align_eff = self._current_class_align_lambda()
+        if (
+            lambda_class_align_eff > 0.0
+            and target_logits is not None
+            and target_logits.numel() > 0
+            and z_tgt is not None
+            and z_tgt.numel() > 0
+            and z_src.numel() > 0
+        ):
+            probs_t = torch.softmax(target_logits.detach().float(), dim=1)
+            conf_t, hard_t = torch.max(probs_t, dim=1)
+            conf_mask = conf_t > float(self.class_align_conf_thresh)
+            n_conf = int(conf_mask.sum().detach().item())
+            aux_items["class_align_n_conf"] = float(n_conf)
+            aux_items["lambda_class_align_eff"] = float(lambda_class_align_eff)
+            if n_conf >= max(1, int(self.class_align_min_conf_samples)):
+                z_tgt_conf = z_tgt[conf_mask]
+                probs_conf = probs_t[conf_mask]
+
+                pos_label = int(self.stage1_positive_label)
+                bg_label = int(self.stage1_background_label)
+                pos_mask = (source_labels == pos_label)
+                neg_mask = (source_labels == bg_label)
+                z_s_pos = z_src[pos_mask]
+                z_s_neg = z_src[neg_mask]
+
+                if self.class_align_use_soft_weights:
+                    w_pos = probs_conf[:, pos_label]
+                    w_bg = probs_conf[:, bg_label]
+                else:
+                    hard_conf = hard_t[conf_mask]
+                    w_pos = (hard_conf == pos_label).float()
+                    w_bg = (hard_conf == bg_label).float()
+
+                loss_cc_pos = self._zero_tensor()
+                if z_s_pos.numel() > 0 and float(w_pos.sum().detach().item()) > 0.0:
+                    loss_cc_pos = self._mmd_rbf(z_s_pos, z_tgt_conf, y_weights=w_pos)
+
+                loss_cc_neg = self._zero_tensor()
+                if z_s_neg.numel() > 0 and float(w_bg.sum().detach().item()) > 0.0:
+                    loss_cc_neg = self._mmd_rbf(z_s_neg, z_tgt_conf, y_weights=w_bg)
+
+                loss_class_align = loss_cc_pos + loss_cc_neg
+                aux_items["class_align_pos"] = float(loss_cc_pos.detach().item())
+                aux_items["class_align_neg"] = float(loss_cc_neg.detach().item())
+                aux_items["class_align"] = float(loss_class_align.detach().item())
+
+        loss_prior = self._zero_tensor()
+        lambda_prior_eff = self._current_prior_lambda()
+        if lambda_prior_eff > 0.0 and target_logits is not None and target_logits.numel() > 0:
+            loss_prior, mean_pos_prob = self._prior_interval_loss(target_logits)
+            aux_items["lambda_prior_eff"] = float(lambda_prior_eff)
+            aux_items["prior_mean_pos_prob"] = float(mean_pos_prob)
+            aux_items["prior"] = float(loss_prior.detach().item())
+
+        loss_ccl = self._zero_tensor()
+        lambda_ccl_eff = self._current_ccl_lambda()
+        if lambda_ccl_eff > 0.0 and target_probs is not None and target_probs.numel() > 0:
+            loss_ccl = self._ccl_loss(target_probs)
+            aux_items["lambda_ccl_eff"] = float(lambda_ccl_eff)
+            aux_items["ccl"] = float(loss_ccl.detach().item())
+
+        loss_lsa_content = self._zero_tensor()
+        if float(self.lsa_content_lambda) > 0.0 and target_content_pre is not None and target_content_post is not None:
+            loss_lsa_content = self._pairwise_similarity_preservation_loss(
+                target_content_pre,
+                target_content_post,
+            )
+            aux_items["lsa_content"] = float(loss_lsa_content.detach().item())
+            aux_items["lambda_lsa_content"] = float(self.lsa_content_lambda)
+
+        loss_lsa_identity = self._zero_tensor()
+        if float(self.lsa_identity_lambda) > 0.0 and target_content_pre is not None and target_content_post is not None:
+            loss_lsa_identity = self._feature_identity_loss(
+                target_content_pre,
+                target_content_post,
+            )
+            aux_items["lsa_identity"] = float(loss_lsa_identity.detach().item())
+            aux_items["lambda_lsa_identity"] = float(self.lsa_identity_lambda)
+
         lambda_iahm = float((self.stage1_iahm_cfg or {}).get("lambda_total", 1.0))
-        aux_total = float(self.lambda_align) * loss_align + lambda_iahm * loss_iahm
+        aux_total = (
+            float(self.lambda_align) * loss_align
+            + lambda_iahm * loss_iahm
+            + float(lambda_class_align_eff) * loss_class_align
+            + float(lambda_ccl_eff) * loss_ccl
+            + float(lambda_prior_eff) * loss_prior
+            + float(self.lsa_content_lambda) * loss_lsa_content
+            + float(self.lsa_identity_lambda) * loss_lsa_identity
+        )
         aux_items["aux_total"] = float(aux_total.detach().item())
         return aux_total, aux_items
 
@@ -1451,21 +2766,65 @@ class OptimizedTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == "cuda")):
+                    x_rpt = y_rpt = w_rpt = None
+                    if training and self.rpt_inject_to_ce:
+                        x_rpt, y_rpt, w_rpt = self._sample_rpt_batch(source_labels=y)
+
+                    eval_use_target = (not training) and (source_domain_id is None) and bool(
+                        getattr(self, "_eval_use_target_stats", False)
+                    )
+                    self._set_model_domain_context(
+                        domain_ids=source_domain_id,
+                        use_target_stats=eval_use_target,
+                    )
                     logits, extras = self._forward_unpack(x)
-                    loss_total, items = loss_fn(logits, y, extras)
+                    logits_ce = logits
+                    y_ce = y
+                    synth_embed = None
+                    if x_rpt is not None and y_rpt is not None:
+                        self._set_model_domain_context(domain_ids=None, use_target_stats=False)
+                        synth_logits, synth_extras = self._forward_unpack(x_rpt)
+                        logits_ce = torch.cat([logits, synth_logits], dim=0)
+                        y_ce = torch.cat([y, y_rpt], dim=0)
+                        synth_embed = self._select_hyperbolic_input(synth_logits, synth_extras)
+
+                    loss_total, items = loss_fn(logits_ce, y_ce, extras)
                     if training and self._stage1_has_aux():
                         source_embed = self._select_hyperbolic_input(logits, extras)
                         aux_loss, aux_items = self._stage1_aux_losses(
                             source_embed=source_embed,
                             source_labels=y,
+                            source_domain_id=source_domain_id,
                             target_x=target_x,
                             training=training,
+                            synth_embed=synth_embed,
+                            synth_labels=y_rpt,
+                            synth_weights=w_rpt,
                         )
                         loss_total = loss_total + aux_loss
                         merged = OrderedDict(items)
                         for k, v in aux_items.items():
                             merged[k] = float(v)
                         items = merged
+                    if (
+                        training
+                        and target_x is not None
+                        and float(self.aux_ts_lambda_align) > 0.0
+                        and isinstance(extras, dict)
+                    ):
+                        src_ts = extras.get("ts_features", None)
+                        if isinstance(src_ts, torch.Tensor) and src_ts.numel() > 0:
+                            target_x_aux = target_x.unsqueeze(1) if len(target_x.shape) == 3 else target_x
+                            self._set_model_domain_context(domain_ids=None, use_target_stats=True)
+                            _, target_extras_aux = self._forward_unpack(target_x_aux)
+                            if isinstance(target_extras_aux, dict):
+                                tgt_ts = target_extras_aux.get("ts_features", None)
+                                if isinstance(tgt_ts, torch.Tensor) and tgt_ts.numel() > 0:
+                                    aux_ts_align = self._mmd_rbf(src_ts.float(), tgt_ts.float(), y_weights=None)
+                                    loss_total = loss_total + float(self.aux_ts_lambda_align) * aux_ts_align
+                                    merged = OrderedDict(items)
+                                    merged["aux_ts_align_global"] = float(aux_ts_align.detach().item())
+                                    items = merged
                     probs = torch.softmax(logits, dim=1)
                     preds = logits.argmax(1)
 
@@ -1496,7 +2855,7 @@ class OptimizedTrainer:
                 all_probs.append(probs.detach().cpu())
                 all_preds.append(preds.detach().cpu())
                 all_targets.append(y.detach().cpu())
-                MemoryManager.cleanup_tensors(x, y, logits, source_domain_id)
+                MemoryManager.cleanup_tensors(x, y, logits, source_domain_id, x_rpt, y_rpt)
 
         probabilities = torch.cat(all_probs) if len(all_probs) else torch.empty(0)
         predictions = torch.cat(all_preds) if len(all_preds) else torch.empty(0, dtype=torch.long)
@@ -1575,10 +2934,219 @@ class OptimizedTrainer:
             return F.cross_entropy(logits, y)
         return F.cross_entropy(logits, y, weight=self.class_weights)
 
+    def _set_model_domain_context(
+        self,
+        *,
+        domain_ids: Optional[torch.Tensor] = None,
+        use_target_stats: bool = False,
+    ) -> None:
+        setter = getattr(self.model, "set_domain_context", None)
+        if callable(setter):
+            setter(domain_ids=domain_ids, use_target_stats=use_target_stats)
+
+    def _ensure_prototypes(self, feature_dim: int) -> None:
+        if (
+            self.prototype_vectors is not None
+            and self.prototype_initialized is not None
+            and int(self.prototype_vectors.shape[1]) == int(feature_dim)
+        ):
+            return
+        n_class = int(self.config.get("n_class", 2))
+        self.prototype_vectors = torch.zeros(
+            (n_class, int(feature_dim)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.prototype_initialized = torch.zeros((n_class,), dtype=torch.bool, device=self.device)
+
+    def _prototype_class_weight(self, class_id: int) -> float:
+        if int(class_id) == int(self.prototype_positive_label):
+            return float(self.prototype_positive_weight)
+        if int(class_id) == int(self.prototype_background_label):
+            return float(self.prototype_background_weight)
+        return 1.0
+
+    def _prototype_regularization(self, features: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, OrderedDict]:
+        if (
+            (not self.prototype_enable)
+            or features is None
+            or labels is None
+            or features.numel() == 0
+            or labels.numel() == 0
+            or (
+                float(self.prototype_lambda) <= 0.0
+                and float(self.prototype_separation_lambda) <= 0.0
+            )
+        ):
+            return self._zero_tensor(), OrderedDict()
+
+        features = features.float()
+        labels = labels.long()
+        self._ensure_prototypes(int(features.shape[1]))
+        assert self.prototype_vectors is not None
+        assert self.prototype_initialized is not None
+
+        pull_acc = self._zero_tensor()
+        pull_weight_sum = 0.0
+        batch_means: Dict[int, torch.Tensor] = {}
+
+        for cls in torch.unique(labels).tolist():
+            cls = int(cls)
+            mask = labels == cls
+            if int(mask.sum().item()) <= 0:
+                continue
+            cls_feats = features[mask]
+            batch_mean = cls_feats.mean(dim=0).detach()
+            batch_means[cls] = batch_mean
+
+            if float(self.prototype_lambda) > 0.0:
+                if bool(self.prototype_initialized[cls].item()):
+                    proto = self.prototype_vectors[cls].detach()
+                else:
+                    proto = batch_mean
+                cls_pull = torch.mean(torch.sum((cls_feats - proto.unsqueeze(0)) ** 2, dim=1))
+                cls_weight = float(self._prototype_class_weight(cls))
+                pull_acc = pull_acc + cls_weight * cls_pull
+                pull_weight_sum += cls_weight
+
+        pull_loss = self._zero_tensor()
+        if pull_weight_sum > 0.0:
+            pull_loss = pull_acc / float(pull_weight_sum)
+
+        sep_loss = self._zero_tensor()
+        if float(self.prototype_separation_lambda) > 0.0:
+            pos_cls = int(self.prototype_positive_label)
+            bg_cls = int(self.prototype_background_label)
+            pos_proto = batch_means.get(pos_cls, None)
+            bg_proto = batch_means.get(bg_cls, None)
+            if pos_proto is None and bool(self.prototype_initialized[pos_cls].item()):
+                pos_proto = self.prototype_vectors[pos_cls].detach()
+            if bg_proto is None and bool(self.prototype_initialized[bg_cls].item()):
+                bg_proto = self.prototype_vectors[bg_cls].detach()
+            if pos_proto is not None and bg_proto is not None:
+                proto_dist = torch.norm(pos_proto - bg_proto, p=2)
+                sep_loss = torch.relu(float(self.prototype_separation_margin) - proto_dist) ** 2
+
+        with torch.no_grad():
+            mu = float(self.prototype_momentum)
+            for cls, batch_mean in batch_means.items():
+                if bool(self.prototype_initialized[cls].item()):
+                    self.prototype_vectors[cls].mul_(mu).add_((1.0 - mu) * batch_mean)
+                else:
+                    self.prototype_vectors[cls].copy_(batch_mean)
+                    self.prototype_initialized[cls] = True
+
+        total = float(self.prototype_lambda) * pull_loss + float(self.prototype_separation_lambda) * sep_loss
+        items = OrderedDict()
+        if float(self.prototype_lambda) > 0.0:
+            items["proto_pull"] = float(pull_loss.detach().item())
+        if float(self.prototype_separation_lambda) > 0.0:
+            items["proto_sep"] = float(sep_loss.detach().item())
+        return total, items
+
+    def _positive_distribution_regularization(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, OrderedDict]:
+        if (
+            (not self.posdist_enable)
+            or float(self.posdist_lambda) <= 0.0
+            or features is None
+            or labels is None
+            or features.numel() == 0
+            or labels.numel() == 0
+            or int(self.current_epoch) < max(0, int(self.posdist_start_epoch))
+        ):
+            return self._zero_tensor(), OrderedDict()
+
+        mask = labels.long() == int(self.posdist_positive_label)
+        if int(mask.sum().item()) <= 1:
+            return self._zero_tensor(), OrderedDict()
+
+        pos_feat = features[mask].float()
+        batch_mean = pos_feat.mean(dim=0)
+        batch_var = torch.var(pos_feat, dim=0, unbiased=False)
+
+        if (
+            self.posdist_mean is None
+            or self.posdist_var is None
+            or int(self.posdist_mean.numel()) != int(batch_mean.numel())
+        ):
+            self.posdist_mean = torch.zeros_like(batch_mean)
+            self.posdist_var = torch.zeros_like(batch_var)
+            self.posdist_initialized = False
+
+        if self.posdist_initialized:
+            ref_mean = self.posdist_mean.detach()
+            ref_var = self.posdist_var.detach()
+            mean_loss = torch.mean((batch_mean - ref_mean) ** 2)
+            var_loss = torch.mean((batch_var - ref_var) ** 2)
+        else:
+            mean_loss = self._zero_tensor()
+            var_loss = self._zero_tensor()
+
+        with torch.no_grad():
+            mu = float(self.posdist_momentum)
+            if self.posdist_initialized:
+                self.posdist_mean.mul_(mu).add_((1.0 - mu) * batch_mean.detach())
+                self.posdist_var.mul_(mu).add_((1.0 - mu) * batch_var.detach())
+            else:
+                self.posdist_mean.copy_(batch_mean.detach())
+                self.posdist_var.copy_(batch_var.detach())
+                self.posdist_initialized = True
+
+        total = float(self.posdist_lambda) * (mean_loss + float(self.posdist_var_weight) * var_loss)
+        items = OrderedDict(
+            [
+                ("posdist_mean", float(mean_loss.detach().item())),
+                ("posdist_var", float(var_loss.detach().item())),
+            ]
+        )
+        return total, items
+
     def loss_ce(self, logits, y, extras):
         """Pure CE"""
         ce = self._cross_entropy(logits, y)
-        return ce, OrderedDict([("ce", float(ce.detach().item()))])
+        total = ce
+        items = OrderedDict([("ce", float(ce.detach().item()))])
+
+        if isinstance(extras, dict):
+            flat_logits = extras.get("flat_logits", None)
+            ts_logits = extras.get("ts_logits", None)
+
+            if isinstance(flat_logits, torch.Tensor) and self.dual_head_lambda_flat_ce > 0.0:
+                ce_flat = self._cross_entropy(flat_logits, y)
+                total = total + self.dual_head_lambda_flat_ce * ce_flat
+                items["ce_flat"] = float(ce_flat.detach().item())
+
+            if isinstance(ts_logits, torch.Tensor) and self.dual_head_lambda_ts_ce > 0.0:
+                ce_ts = self._cross_entropy(ts_logits, y)
+                total = total + self.dual_head_lambda_ts_ce * ce_ts
+                items["ce_ts"] = float(ce_ts.detach().item())
+
+            feat = extras.get("features", None)
+            if (
+                isinstance(feat, torch.Tensor)
+                and self.prototype_enable
+                and self.model.training
+            ):
+                proto_loss, proto_items = self._prototype_regularization(feat, y)
+                total = total + proto_loss
+                for k, v in proto_items.items():
+                    items[k] = float(v)
+
+            if (
+                isinstance(feat, torch.Tensor)
+                and self.posdist_enable
+                and self.model.training
+            ):
+                posdist_loss, posdist_items = self._positive_distribution_regularization(feat, y)
+                total = total + posdist_loss
+                for k, v in posdist_items.items():
+                    items[k] = float(v)
+
+        return total, items
 
     def _select_hyperbolic_input(self, logits: torch.Tensor, extras: Any) -> torch.Tensor:
         """

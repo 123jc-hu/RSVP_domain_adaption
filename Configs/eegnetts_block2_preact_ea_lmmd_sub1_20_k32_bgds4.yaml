@@ -1,0 +1,58 @@
+# EEGNet tangent-space head from block2 pre-activation + EA + LMMD
+
+model: EEGNetTS
+dataset: THU
+
+overrides:
+  is_training: true
+  exp_tag: eegnetts_block2_preact_ea_lmmd_sub1_20_k32_bgds4
+
+  source_selection: All
+  all_source_batch_policy: random_k
+  all_source_sampling_mode: uniform
+
+  held_out_start_id: 1
+  held_out_end_id: 20
+
+  subject_batch_size: 64
+  subjects_per_batch: 32
+
+  learning_rate: 0.001
+  random_seed: 2026
+  epochs: 400
+  early_stop_start_epoch: 30
+  patience: 10
+
+  class_weighted_ce: true
+
+  ea_enable: true
+  ea_cov_eps: 1.0e-6
+
+  source_train_bg_downsample_enable: true
+  source_train_bg_downsample_bg_to_pos_ratio: 4.0
+  source_train_bg_downsample_seed: 2026
+
+  use_target_stream: true
+  lambda_align: 0.1
+  alignment_loss: lmmd
+  lambda_ccl: 0.0
+  ccl_start_epoch: 0
+
+  lmmd_use_soft_target: true
+  lmmd_kernel_mul: 2.0
+  lmmd_kernel_num: 5
+  lmmd_fix_sigma: null
+
+  eegnet_ts_cov_eps: 1.0e-4
+  eegnet_ts_head_channels: 16
+  eegnet_ts_feature_layer: block2
+  eegnet_ts_block2_use_activation: false
+
+  val_batch_size: 1024
+  minimal_log: true
+  debug_domain_batch: false
+  log_runtime: false
+
+  deterministic_run: true
+  cudnn_benchmark: false
+  matmul_precision: highest

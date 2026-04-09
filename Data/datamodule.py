@@ -5,7 +5,8 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from Data.npz_io import ensure_npz_cache
+from Data.npz_io import ensure_npz_cache, ensure_subject_ea_cache
+from Data.rsf_preprocessing import ensure_rsf_fold_cache
 from Data.source_selection import (
     SelectionManager,
     normalize_score_map,
@@ -32,10 +33,17 @@ class NPZMemmapSubsetDataset(Dataset):
         x_key: str = "x_data",
         y_key: str = "y_data",
         indices: Optional[Union[np.ndarray, slice]] = None,
+        use_ea: bool = False,
+        ea_cov_eps: float = 1e-6,
     ):
         self.file_path = Path(file_path)
-        cache_dir = ensure_npz_cache(self.file_path, [f"{x_key}.npy", f"{y_key}.npy"])
-        self.x_data = np.load(cache_dir / f"{x_key}.npy", mmap_mode="r")
+        if use_ea:
+            cache_dir = ensure_subject_ea_cache(self.file_path, x_key=x_key, cov_eps=float(ea_cov_eps))
+            x_member = f"{x_key}_ea.npy"
+        else:
+            cache_dir = ensure_npz_cache(self.file_path, [f"{x_key}.npy", f"{y_key}.npy"])
+            x_member = f"{x_key}.npy"
+        self.x_data = np.load(cache_dir / x_member, mmap_mode="r")
         self.y_data = np.load(cache_dir / f"{y_key}.npy", mmap_mode="r")
 
         n = int(self.y_data.shape[0])
@@ -77,6 +85,26 @@ class UnlabeledViewDataset(Dataset):
         if not isinstance(item, (tuple, list)) or len(item) == 0:
             raise ValueError("Expected base dataset item as (x, y, ...).")
         return item[0]
+
+
+class CachedMemmapDataset(Dataset):
+    """Dataset backed by precomputed .npy arrays on disk."""
+
+    def __init__(self, x_path: Union[str, Path], y_path: Union[str, Path]):
+        self.x_path = Path(x_path)
+        self.y_path = Path(y_path)
+        self.x_data = np.load(self.x_path, mmap_mode="r")
+        self.y_data = np.load(self.y_path, mmap_mode="r")
+        self.indices = np.arange(int(self.y_data.shape[0]), dtype=np.int64)
+
+    def __len__(self):
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, idx):
+        real_idx = int(self.indices[idx])
+        x = np.asarray(self.x_data[real_idx], dtype=np.float32).copy()
+        y = int(self.y_data[real_idx])
+        return torch.from_numpy(x), torch.tensor(y).long()
 
 
 class SubjectLabeledConcatDataset(ConcatDataset):
@@ -164,6 +192,8 @@ class SubjectBatchDataLoader:
         per_subject_batch_size: int,
         steps_per_epoch: int,
         random_subjects_each_step: bool,
+        subject_sampling_weights: Optional[Dict[str, float]] = None,
+        subject_sampling_mix_alpha: float = 0.2,
         seed: int = 2026,
         pin_memory: bool = False,
     ):
@@ -186,6 +216,8 @@ class SubjectBatchDataLoader:
         self.per_subject_batch_size = int(per_subject_batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
         self.random_subjects_each_step = bool(random_subjects_each_step)
+        self.subject_sampling_weights = dict(subject_sampling_weights or {})
+        self.subject_sampling_mix_alpha = float(np.clip(subject_sampling_mix_alpha, 0.0, 1.0))
         self.seed = int(seed)
         self.pin_memory = bool(pin_memory)
 
@@ -211,6 +243,27 @@ class SubjectBatchDataLoader:
 
     def _pick_subjects(self, rng: np.random.Generator) -> List[str]:
         if self.random_subjects_each_step:
+            if self.subject_sampling_weights:
+                scores = np.asarray(
+                    [float(self.subject_sampling_weights.get(k, 0.0)) for k in self.subject_keys_for_sampling],
+                    dtype=np.float64,
+                )
+                scores = np.where(np.isfinite(scores), scores, 0.0)
+                if np.min(scores) < 0.0:
+                    scores = scores - float(np.min(scores))
+                total = float(np.sum(scores))
+                if total > 0.0:
+                    probs = scores / total
+                    uniform = np.full_like(probs, 1.0 / float(probs.shape[0]))
+                    probs = (1.0 - self.subject_sampling_mix_alpha) * probs + self.subject_sampling_mix_alpha * uniform
+                    probs = probs / float(np.sum(probs))
+                    idx = rng.choice(
+                        len(self.subject_keys_for_sampling),
+                        size=self.subjects_per_batch,
+                        replace=False,
+                        p=probs,
+                    )
+                    return [self.subject_keys_for_sampling[int(i)] for i in idx]
             idx = rng.choice(
                 len(self.subject_keys_for_sampling),
                 size=self.subjects_per_batch,
@@ -248,7 +301,25 @@ class SubjectBatchDataLoader:
                 break
 
             if self.random_subjects_each_step:
-                idx = rng.choice(len(available_subjects), size=self.subjects_per_batch, replace=False)
+                if self.subject_sampling_weights:
+                    scores = np.asarray(
+                        [float(self.subject_sampling_weights.get(k, 0.0)) for k in available_subjects],
+                        dtype=np.float64,
+                    )
+                    scores = np.where(np.isfinite(scores), scores, 0.0)
+                    if np.min(scores) < 0.0:
+                        scores = scores - float(np.min(scores))
+                    total = float(np.sum(scores))
+                    if total > 0.0:
+                        probs = scores / total
+                        uniform = np.full_like(probs, 1.0 / float(probs.shape[0]))
+                        probs = (1.0 - self.subject_sampling_mix_alpha) * probs + self.subject_sampling_mix_alpha * uniform
+                        probs = probs / float(np.sum(probs))
+                        idx = rng.choice(len(available_subjects), size=self.subjects_per_batch, replace=False, p=probs)
+                    else:
+                        idx = rng.choice(len(available_subjects), size=self.subjects_per_batch, replace=False)
+                else:
+                    idx = rng.choice(len(available_subjects), size=self.subjects_per_batch, replace=False)
                 chosen_subjects = [available_subjects[int(i)] for i in idx]
             else:
                 chosen_subjects = list(available_subjects[: self.subjects_per_batch])
@@ -441,19 +512,23 @@ class EEGDataModuleCrossSubject:
         self.source_candidate_keys: List[str] = []
         self.source_train_class_counts: Optional[np.ndarray] = None
         self.source_selection_info: Dict[str, Any] = {}
-        self.source_train_dataset_map: Dict[str, NPZMemmapSubsetDataset] = {}
+        self.source_train_dataset_map: Dict[str, Dataset] = {}
+        self.source_train_indices_map: Dict[str, np.ndarray] = {}
+        self.source_val_indices_map: Dict[str, np.ndarray] = {}
         self.source_candidate_train_counts: Dict[str, int] = {}
         self.train_steps_per_epoch: Optional[int] = None
         self.train_subject_batch_size: Optional[int] = None
         self.train_subjects_per_batch: Optional[int] = None
         self.train_subject_batch_policy: Optional[str] = None
         self.train_subject_sampling_keys: List[str] = []
+        self.train_subject_sampling_mode: Optional[str] = None
         self.train_step_reference_mode: Optional[str] = None
         self.train_step_reference_subject: Optional[str] = None
         self.train_step_reference_samples: Optional[int] = None
 
         self._label_cache: Dict[str, np.ndarray] = {}
         self._external_source_scores: Dict[str, float] = {}
+        self._dynamic_source_scores: Dict[str, float] = {}
         self._external_manual_sources: List[str] = []
         self._forced_source_selection_mode: Optional[str] = None
         self.selection_manager = SelectionManager(seed=self.seed)
@@ -468,6 +543,31 @@ class EEGDataModuleCrossSubject:
             if self.prefetch_factor is not None:
                 kwargs["prefetch_factor"] = self.prefetch_factor
         return kwargs
+
+    def _use_ea(self) -> bool:
+        return bool(self.config.get("ea_enable", False))
+
+    def _ea_cov_eps(self) -> float:
+        return float(self.config.get("ea_cov_eps", 1e-6))
+
+    def _use_rsf(self) -> bool:
+        return bool(self.config.get("rsf_enable", False))
+
+    def _make_subject_dataset(
+        self,
+        file_path: Union[str, Path],
+        *,
+        indices: Optional[Union[np.ndarray, slice]] = None,
+    ) -> NPZMemmapSubsetDataset:
+        return NPZMemmapSubsetDataset(
+            file_path,
+            indices=indices,
+            use_ea=self._use_ea(),
+            ea_cov_eps=self._ea_cov_eps(),
+        )
+
+    def _make_cached_dataset(self, x_path: Union[str, Path], y_path: Union[str, Path]) -> CachedMemmapDataset:
+        return CachedMemmapDataset(x_path, y_path)
 
     def prepare_data(
         self,
@@ -494,12 +594,18 @@ class EEGDataModuleCrossSubject:
         self.test_path = self.subject_file_map[held_out]
 
         self._external_source_scores = normalize_score_map(source_scores)
+        self._dynamic_source_scores = {}
         self._external_manual_sources = normalize_subject_list(manual_source_subjects)
         self._forced_source_selection_mode = (
             str(forced_source_selection_mode).strip().lower()
             if forced_source_selection_mode is not None
             else None
         )
+    def set_dynamic_source_scores(self, score_map: Optional[Dict[Union[str, int], float]]) -> None:
+        self._dynamic_source_scores = normalize_score_map(score_map)
+
+    def clear_dynamic_source_scores(self) -> None:
+        self._dynamic_source_scores = {}
 
     def setup(self):
         assert self.subject_file_map is not None, "Call prepare_data() first."
@@ -517,6 +623,8 @@ class EEGDataModuleCrossSubject:
         source_train_parts: List[Dataset] = []
         source_val_parts: List[Dataset] = []
         self.source_train_dataset_map = {}
+        self.source_train_indices_map = {}
+        self.source_val_indices_map = {}
         self.source_candidate_train_counts = {}
         n_class = int(self.config.get("n_class", 2))
         class_counts = np.zeros(n_class, dtype=np.int64)
@@ -529,24 +637,64 @@ class EEGDataModuleCrossSubject:
                 all_idx,
                 test_size=self.source_val_ratio,
             )
+            tr_idx = self._maybe_downsample_source_train_indices(
+                subject_key=sub_key,
+                train_indices=tr_idx,
+            )
             self.source_candidate_train_counts[sub_key] = int(tr_idx.shape[0])
 
             if sub_key in selected_set:
-                train_ds = NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=tr_idx)
-                val_ds = NPZMemmapSubsetDataset(self.subject_file_map[sub_key], indices=va_idx)
+                self.source_train_indices_map[sub_key] = np.asarray(tr_idx, dtype=np.int64)
+                self.source_val_indices_map[sub_key] = np.asarray(va_idx, dtype=np.int64)
+                labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
+                class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
+
+        if self._use_rsf():
+            cache_info = ensure_rsf_fold_cache(
+                config=self.config,
+                subject_file_map=self.subject_file_map,
+                held_out_key=held_out,
+                source_subject_keys=self.source_subject_keys,
+                source_train_indices_map=self.source_train_indices_map,
+                source_val_indices_map=self.source_val_indices_map,
+            )
+            cache_dir = Path(cache_info["cache_dir"])
+            for sub_key in self.source_subject_keys:
+                train_ds = self._make_cached_dataset(
+                    cache_dir / f"{sub_key}_train_x.npy",
+                    cache_dir / f"{sub_key}_train_y.npy",
+                )
+                val_ds = self._make_cached_dataset(
+                    cache_dir / f"{sub_key}_val_x.npy",
+                    cache_dir / f"{sub_key}_val_y.npy",
+                )
                 self.source_train_dataset_map[sub_key] = train_ds
                 source_train_parts.append(train_ds)
                 source_val_parts.append(val_ds)
-                labels = self._load_subject_labels(self.subject_file_map[sub_key])[tr_idx]
-                class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
+            target_labeled = self._make_cached_dataset(
+                cache_dir / f"{held_out}_target_x.npy",
+                cache_dir / f"{held_out}_target_y.npy",
+            )
+        else:
+            for sub_key in self.source_subject_keys:
+                train_ds = self._make_subject_dataset(
+                    self.subject_file_map[sub_key],
+                    indices=self.source_train_indices_map[sub_key],
+                )
+                val_ds = self._make_subject_dataset(
+                    self.subject_file_map[sub_key],
+                    indices=self.source_val_indices_map[sub_key],
+                )
+                self.source_train_dataset_map[sub_key] = train_ds
+                source_train_parts.append(train_ds)
+                source_val_parts.append(val_ds)
+            target_n = self._subject_len(held_out)
+            target_idx = np.arange(target_n, dtype=np.int64)
+            target_labeled = self._make_subject_dataset(self.subject_file_map[held_out], indices=target_idx)
 
         self.train_dataset = SubjectLabeledConcatDataset(source_train_parts, self.source_subject_keys)
         self.val_dataset = ConcatDataset(source_val_parts)
         self.source_train_class_counts = class_counts
-
-        target_n = self._subject_len(held_out)
-        target_idx = np.arange(target_n, dtype=np.int64)
-        target_labeled = NPZMemmapSubsetDataset(self.subject_file_map[held_out], indices=target_idx)
         self.target_unlabeled_dataset = UnlabeledViewDataset(target_labeled)
         self.test_dataset = target_labeled
 
@@ -602,9 +750,21 @@ class EEGDataModuleCrossSubject:
 
         all_source_mode = str(self.source_selection_info.get("mode", "")).strip().lower() == "all"
         all_source_policy = str(self.config.get("all_source_batch_policy", "random_k")).strip().lower()
+        all_source_sampling_mode = str(self.config.get("all_source_sampling_mode", "uniform")).strip().lower()
+        all_source_sampling_mix_alpha = float(self.config.get("all_source_sampling_mix_alpha", 0.2))
+        weighted_scores: Dict[str, float] = {}
 
         if all_source_mode and all_source_policy == "random_k":
             policy = "random_k_each_step"
+            score_map = self._dynamic_source_scores or self._external_source_scores
+            if all_source_sampling_mode == "score_weighted" and score_map:
+                policy = "random_k_each_step_score_weighted"
+                selected_set = set(self.source_subject_keys)
+                weighted_scores = {
+                    k: float(v)
+                    for k, v in score_map.items()
+                    if k in selected_set
+                }
             random_subjects_each_step = True
             subject_keys_for_sampling = list(self.source_subject_keys)
         else:
@@ -631,6 +791,7 @@ class EEGDataModuleCrossSubject:
         self.train_subjects_per_batch = subjects_per_batch
         self.train_subject_batch_policy = policy
         self.train_subject_sampling_keys = list(subject_keys_for_sampling)
+        self.train_subject_sampling_mode = all_source_sampling_mode if random_subjects_each_step else "fixed_pool"
         self.train_step_reference_mode = ref_mode_effective
         self.train_step_reference_subject = ref_subject
         self.train_step_reference_samples = ref_samples
@@ -644,6 +805,8 @@ class EEGDataModuleCrossSubject:
                 per_subject_batch_size=per_subject_batch_size,
                 steps_per_epoch=steps_per_epoch,
                 random_subjects_each_step=True,
+                subject_sampling_weights=weighted_scores,
+                subject_sampling_mix_alpha=all_source_sampling_mix_alpha,
                 seed=loader_seed,
                 pin_memory=self.pin_memory,
             )
@@ -707,6 +870,9 @@ class EEGDataModuleCrossSubject:
                 "rpcs": "scores",
                 "similarityonly": "scores",
                 "discrimonly": "scores",
+                "corrall": "scores",
+                "mmdall": "scores",
+                "jsdall": "scores",
             }
             mode = strategy_map.get(strategy, "all")
 
@@ -754,9 +920,155 @@ class EEGDataModuleCrossSubject:
         }
         return selected
 
+    def _feature_sampling_cache_root(self) -> Path:
+        cache_root_cfg = self.config.get("dynamic_feature_sampling_cache_root", None)
+        if cache_root_cfg not in (None, "", "None", "none", "null", "NULL"):
+            return Path(str(cache_root_cfg))
+        return Path(__file__).resolve().parents[1] / "Cache" / "feature_sampling_support"
+
+    def _cached_support_indices(
+        self,
+        *,
+        cache_group: str,
+        subject_key: str,
+        candidate_indices: np.ndarray,
+        max_samples: int,
+        seed: int,
+    ) -> np.ndarray:
+        candidate_indices = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
+        if candidate_indices.size == 0:
+            return candidate_indices
+        max_samples = max(1, int(max_samples))
+        if candidate_indices.size <= max_samples:
+            return candidate_indices
+
+        dataset_name = str(self.config.get("dataset", "dataset")).strip()
+        cache_root = self._feature_sampling_cache_root() / dataset_name / cache_group / f"seed_{int(seed)}"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_root / f"{normalize_subject_key(subject_key)}_n{int(max_samples)}.npz"
+        if cache_path.exists():
+            cached = np.load(cache_path)
+            idx = np.asarray(cached["indices"], dtype=np.int64)
+            if idx.size > 0:
+                return idx
+
+        rng = np.random.default_rng(int(seed) + int(normalize_subject_key(subject_key)[3:]))
+        chosen = candidate_indices[rng.permutation(candidate_indices.shape[0])[:max_samples]]
+        chosen = np.asarray(chosen, dtype=np.int64)
+        np.savez_compressed(cache_path, indices=chosen)
+        return chosen
+
+    def get_dynamic_feature_source_support_datasets(
+        self,
+        *,
+        max_samples_per_subject: int,
+        seed: Optional[int] = None,
+    ) -> Dict[str, NPZMemmapSubsetDataset]:
+        if self.subject_file_map is None:
+            raise RuntimeError("Call prepare_data() first.")
+        if not self.source_train_dataset_map:
+            raise RuntimeError("Call setup() first.")
+        use_seed = self.seed if seed is None else int(seed)
+        out: Dict[str, NPZMemmapSubsetDataset] = {}
+        for skey in self.source_subject_keys:
+            train_ds = self.source_train_dataset_map[skey]
+            support_idx = self._cached_support_indices(
+                cache_group="source_train",
+                subject_key=skey,
+                candidate_indices=np.asarray(train_ds.indices, dtype=np.int64),
+                max_samples=int(max_samples_per_subject),
+                seed=use_seed,
+            )
+            out[skey] = self._make_subject_dataset(self.subject_file_map[skey], indices=support_idx)
+        return out
+
+    def get_dynamic_feature_target_support_dataset(
+        self,
+        *,
+        max_samples: int,
+        seed: Optional[int] = None,
+    ) -> NPZMemmapSubsetDataset:
+        if self.subject_file_map is None or self.test_subject_id is None:
+            raise RuntimeError("Call prepare_data() first.")
+        held_out = f"sub{int(self.test_subject_id)}"
+        use_seed = self.seed if seed is None else int(seed)
+        all_idx = np.arange(self._subject_len(held_out), dtype=np.int64)
+        support_idx = self._cached_support_indices(
+            cache_group="target_full",
+            subject_key=held_out,
+            candidate_indices=all_idx,
+            max_samples=int(max_samples),
+            seed=use_seed,
+        )
+        return self._make_subject_dataset(self.subject_file_map[held_out], indices=support_idx)
+
     def _subject_len(self, sub_key: str) -> int:
         y = self._load_subject_labels(self.subject_file_map[sub_key])
         return int(y.shape[0])
+
+    def _source_downsample_cache_root(self) -> Path:
+        cache_root_cfg = self.config.get("source_train_bg_downsample_cache_root", None)
+        if cache_root_cfg not in (None, "", "None", "none", "null", "NULL"):
+            return Path(str(cache_root_cfg))
+        return Path(__file__).resolve().parents[1] / "Cache" / "source_train_bg_downsample"
+
+    def _maybe_downsample_source_train_indices(
+        self,
+        *,
+        subject_key: str,
+        train_indices: np.ndarray,
+    ) -> np.ndarray:
+        enabled = bool(self.config.get("source_train_bg_downsample_enable", False))
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        if not enabled or train_indices.size == 0:
+            return train_indices
+
+        bg_ratio = float(self.config.get("source_train_bg_downsample_bg_to_pos_ratio", 4.0))
+        if bg_ratio <= 0:
+            raise ValueError("source_train_bg_downsample_bg_to_pos_ratio must be > 0.")
+
+        pos_label = int(self.config.get("source_train_bg_downsample_positive_label", 1))
+        bg_label = int(self.config.get("source_train_bg_downsample_background_label", 0))
+        seed = int(self.config.get("source_train_bg_downsample_seed", self.seed))
+
+        cache_root = self._source_downsample_cache_root()
+        dataset_name = str(self.config.get("dataset", "dataset")).strip()
+        ratio_tag = str(bg_ratio).replace(".", "p")
+        cache_dir = cache_root / dataset_name / f"seed_{seed}" / f"bg{bg_label}_pos{pos_label}_r{ratio_tag}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{normalize_subject_key(subject_key)}.npz"
+
+        if cache_path.exists():
+            cached = np.load(cache_path)
+            cached_indices = np.asarray(cached["train_indices"], dtype=np.int64)
+            return cached_indices
+
+        labels_all = self._load_subject_labels(self.subject_file_map[subject_key])
+        labels = np.asarray(labels_all[train_indices], dtype=np.int64).reshape(-1)
+
+        pos_mask = labels == pos_label
+        bg_mask = labels == bg_label
+        pos_idx = train_indices[pos_mask]
+        bg_idx = train_indices[bg_mask]
+        other_idx = train_indices[~(pos_mask | bg_mask)]
+
+        if pos_idx.size == 0 or bg_idx.size == 0:
+            np.savez_compressed(cache_path, train_indices=train_indices)
+            return train_indices
+
+        max_bg = int(np.floor(float(pos_idx.size) * bg_ratio))
+        max_bg = max(1, max_bg)
+        keep_bg = min(int(bg_idx.size), max_bg)
+
+        rng = np.random.default_rng(seed + int(normalize_subject_key(subject_key)[3:]))
+        chosen_bg = bg_idx[rng.permutation(bg_idx.shape[0])[:keep_bg]]
+
+        kept = np.concatenate([pos_idx, chosen_bg, other_idx], axis=0)
+        kept = kept[rng.permutation(kept.shape[0])]
+        kept = np.asarray(kept, dtype=np.int64)
+
+        np.savez_compressed(cache_path, train_indices=kept)
+        return kept
 
     def _split_indices_for_subject(
         self,

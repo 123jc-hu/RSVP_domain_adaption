@@ -707,6 +707,8 @@ def select_topk(
     tau_d_percentile: float = 30.0,
     tau_s_percentile: float = 70.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows_all = list(rows)
+    rows_all.sort(key=lambda r: float(r["score"]), reverse=True)
     ranked, meta = _apply_hard_constraints(
         rows,
         tau_d=tau_d,
@@ -715,7 +717,25 @@ def select_topk(
         tau_s_percentile=tau_s_percentile,
     )
     if k is not None and int(k) > 0:
-        ranked = ranked[: int(k)]
+        k = int(k)
+        num_after_gate = len(ranked)
+        if len(ranked) < k:
+            selected_subjects = {str(r["subject"]) for r in ranked}
+            for row in rows_all:
+                if str(row["subject"]) in selected_subjects:
+                    continue
+                ranked.append(row)
+                selected_subjects.add(str(row["subject"]))
+                if len(ranked) >= k:
+                    break
+            meta["backfill_used"] = True
+        else:
+            meta["backfill_used"] = False
+        meta["num_after_gate"] = num_after_gate
+        ranked = ranked[:k]
+    else:
+        meta["backfill_used"] = False
+        meta["num_after_gate"] = len(ranked)
     return ranked, meta
 
 

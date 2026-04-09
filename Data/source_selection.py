@@ -59,6 +59,12 @@ def _normalize_mode_name(mode: str) -> str:
         "similarity_only": "scores",
         "discrim_only": "scores",
         "discriminability_only": "scores",
+        "corrall": "scores",
+        "corr_all": "scores",
+        "mmdall": "scores",
+        "mmd_all": "scores",
+        "jsdall": "scores",
+        "jsd_all": "scores",
     }
     return mode_alias.get(m, m)
 

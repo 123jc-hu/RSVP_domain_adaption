@@ -248,6 +248,7 @@ def inject_into_target_trials(
     cov_shrinkage: float = 0.0,
     input_layout: str = "channel_first",
     rpcs_weighted_sampling: bool = True,
+    clip_factor: float = 3.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Inject transported effects into target background trials and synthesize target-style P300.
@@ -284,7 +285,7 @@ def inject_into_target_trials(
 
     rng = np.random.default_rng(int(seed))
     synth_trials: List[np.ndarray] = []
-    synth_weights = np.zeros(n_out, dtype=np.float64)
+    synth_weights: List[float] = []
 
     for idx in range(n_out):
         eff_idx = int(rng.choice(len(pool), p=sample_weights))
@@ -306,12 +307,24 @@ def inject_into_target_trials(
         x_synth_ct = whiten_recolor(trial_ct, r_bg, r_synth, eps=float(cov_eps))
         x_synth = _from_channel_first_trial(x_synth_ct, was_transposed)
 
+        if not np.isfinite(x_synth).all():
+            continue
+
+        target_scale = float(np.max(np.abs(trial_raw))) if trial_raw.size > 0 else 0.0
+        if not np.isfinite(target_scale) or target_scale <= 0.0:
+            target_scale = 1.0
+        clip_val = float(max(1e-6, float(clip_factor) * target_scale))
+        x_synth = np.clip(x_synth, -clip_val, clip_val)
+        if not np.isfinite(x_synth).all():
+            continue
+
         synth_trials.append(x_synth.astype(np.float64, copy=False))
-        synth_weights[idx] = float(max(raw_score, 0.0))
+        synth_weights.append(float(max(raw_score, 0.0)))
 
     synth_arr = np.stack(synth_trials, axis=0) if synth_trials else np.empty((0,) + tuple(target.shape[1:]), dtype=np.float64)
     synth_labels = np.ones(int(synth_arr.shape[0]), dtype=np.int64)
-    return synth_arr, synth_labels, synth_weights[: int(synth_arr.shape[0])]
+    synth_weight_arr = np.asarray(synth_weights, dtype=np.float64)
+    return synth_arr, synth_labels, synth_weight_arr[: int(synth_arr.shape[0])]
 
 
 def generate_rpt_augmented_batch(
@@ -333,6 +346,7 @@ def generate_rpt_augmented_batch(
     cov_shrinkage: float = 0.0,
     input_layout: str = "channel_first",
     rpcs_weighted_sampling: bool = True,
+    clip_factor: float = 3.0,
 ) -> Dict[str, np.ndarray]:
     """
     Full RPT-Aug pipeline: extract -> transport -> inject.
@@ -370,6 +384,7 @@ def generate_rpt_augmented_batch(
         cov_shrinkage=float(cov_shrinkage),
         input_layout=str(input_layout),
         rpcs_weighted_sampling=bool(rpcs_weighted_sampling),
+        clip_factor=float(clip_factor),
     )
     return {
         "trials": trials,
@@ -400,6 +415,7 @@ class RPTAugmentor:
         cov_shrinkage: float = 0.0,
         input_layout: str = "channel_first",
         rpcs_weighted_sampling: bool = True,
+        clip_factor: float = 3.0,
     ):
         self.rpcs_result = dict(rpcs_result or {})
         self.source_p300_trials = source_p300_trials
@@ -414,6 +430,7 @@ class RPTAugmentor:
         self.cov_shrinkage = float(cov_shrinkage)
         self.input_layout = str(input_layout)
         self.rpcs_weighted_sampling = bool(rpcs_weighted_sampling)
+        self.clip_factor = float(clip_factor)
 
         self._prepared = False
         self._transported_effects: Dict[str, List[Dict[str, Any]]] = {}
@@ -495,6 +512,6 @@ class RPTAugmentor:
             cov_shrinkage=self.cov_shrinkage,
             input_layout=self.input_layout,
             rpcs_weighted_sampling=self.rpcs_weighted_sampling,
+            clip_factor=self.clip_factor,
         )
         return {"trials": trials, "labels": labels, "weights": weights}
-

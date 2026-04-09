@@ -19,6 +19,36 @@ early_stop_start_epoch: 30
 cosine_eta_min_factor: 0.01
 class_weighted_ce: true
 
+# Optional subject-wise Euclidean Alignment preprocessing
+ea_enable: false
+ea_cov_eps: 1.0e-6
+
+# Optional fold-level Riemannian Spatial Filtering preprocessing
+rsf_enable: false
+rsf_mode: plain
+rsf_dim: 8
+rsf_cov_estimator: lwf
+rsf_solver: trust-constr
+rsf_maxiter: 1000
+rsf_tolerance: 1.0e-8
+rsf_domain_lambda: 0.0
+rsf_fit_max_trials_per_class_per_subject: null
+rsf_fit_balance_classes: false
+
+# Optional unbalanced optimal transport alignment
+uot_eps: 0.1
+uot_tau_source: 1.0
+uot_tau_target: 1.0
+uot_max_iter: 30
+
+# Optional source-train background downsampling
+# Applied only to source train split after train/val split; val/test untouched.
+source_train_bg_downsample_enable: false
+source_train_bg_downsample_bg_to_pos_ratio: 4.0
+source_train_bg_downsample_seed: 2026
+source_train_bg_downsample_positive_label: 1
+source_train_bg_downsample_background_label: 0
+
 # Runtime profiling
 log_runtime: true
 rt_deadline_ms: 200.0
@@ -36,6 +66,85 @@ source_selection_min_score: null
 subject_batch_size: 64      # b: samples per selected subject in one training step
 subjects_per_batch: 16      # K: number of source subjects sampled per training step
 all_source_batch_policy: random_k  # All-Source mode: random_k (random K each step) | fixed_k
+all_source_sampling_mode: uniform  # uniform | score_weighted
+all_source_sampling_mix_alpha: 0.2
+
+# Dynamic feature-space sampling (All-source only)
+dynamic_feature_sampling_enable: false
+dynamic_feature_sampling_warmup_epochs: 10
+dynamic_feature_sampling_refresh_every: 10
+dynamic_feature_sampling_source_support_size: 128
+dynamic_feature_sampling_target_support_size: 128
+dynamic_feature_sampling_seed: 2026
+dynamic_feature_sampling_metric: mmd    # mmd | mean_cosine | mean_euclidean | soft_class_mmd
+dynamic_feature_sampling_temperature: 1.0
+dynamic_feature_sampling_mix_alpha: 0.2
+dynamic_feature_sampling_l2_normalize: true
+dynamic_feature_sampling_score_eps: 1.0e-6
+dynamic_feature_sampling_mmd_sigma: 1.0
+dynamic_feature_sampling_batch_size: 256
+dynamic_feature_sampling_pos_weight: 0.7
+dynamic_feature_sampling_use_confidence_weight: true
+dynamic_feature_sampling_min_class_samples: 8
+dynamic_feature_sampling_score_ema_enable: false
+dynamic_feature_sampling_score_ema_decay: 0.8
+
+# DSAN-CCL / LMMD controls
+lmmd_use_soft_target: true
+lmmd_kernel_mul: 2.0
+lmmd_kernel_num: 5
+lmmd_fix_sigma: null
+
+# DSAN-CCL backbone controls
+dsan_num_filters: 64
+dsan_temporal_kernel: 13
+dsan_pool_kernel: 35
+dsan_pool_stride: 7
+dsan_feature_dim: 1024
+dsan_classifier_hidden_dim: 512
+dsan_dropout: 0.5
+
+# EEGNet tangent-space head controls
+eegnet_ts_cov_eps: 1.0e-4
+eegnet_ts_cov_shrinkage_alpha: 0.0
+eegnet_ts_head_channels: 16
+eegnet_ts_feature_layer: block2
+eegnet_dual_output_mode: fusion
+eegnet_dual_fusion_flat_weight: 0.7
+eegnet_dual_lambda_flat_ce: 0.0
+eegnet_dual_lambda_ts_ce: 0.0
+eegnet_aux_ts_lambda_align: 0.0
+
+# Source-only prototype regularization
+prototype_enable: false
+prototype_lambda: 0.0
+prototype_momentum: 0.9
+prototype_positive_weight: 1.0
+prototype_background_weight: 1.0
+prototype_positive_label: 1
+prototype_background_label: 0
+prototype_separation_lambda: 0.0
+prototype_separation_margin: 1.0
+
+# Positive-only distribution regularization
+posdist_enable: false
+posdist_lambda: 0.0
+posdist_start_epoch: 0
+posdist_var_weight: 1.0
+posdist_momentum: 0.9
+posdist_positive_label: 1
+
+# Latent style adapter controls
+lsa_content_lambda: 0.0
+lsa_identity_lambda: 0.0
+lsa_style_momentum: 0.1
+lsa_init_gate: 0.1
+lsa_target_blend_alpha: 0.1
+lsa_similarity_tau: 1.0
+lsa_var_distance_weight: 1.0
+gsldsa_target_blend_alpha: 0.1
+gsldsa_var_distance_weight: 1.0
+dgldsa_target_blend_alpha: 0.1
 
 # DA framework switches (scaffold stage)
 use_target_stream: false
@@ -43,7 +152,19 @@ embedding_space: Euclidean  # Options: Hyperbolic | Euclidean
 psi_method: None            # Options: Tangent_Space | Time_Domain | None
 training_mode: End2End      # Options: Decoupled | End2End
 lambda_align: 0.0
-alignment_loss: mmd         # currently supports: mmd
+alignment_loss: mmd         # supports: mmd, lmmd, global_mmd, per_subject_mmd, global_coral, per_subject_coral
+lambda_class_align: 0.0
+class_align_start_epoch: 30
+class_align_conf_thresh: 0.8
+class_align_min_conf_samples: 8
+class_align_use_soft_weights: true
+lambda_ccl: 0.0
+ccl_start_epoch: 0
+lambda_prior: 0.0
+prior_start_epoch: 30
+prior_min: 0.03
+prior_max: 0.09
+prior_loss_type: l2
 logit_adjustment: false
 pseudo_refinement: false
 
@@ -71,7 +192,10 @@ rpt_aug_enable: false
 rpt_aug_beta: 1.0
 rpt_aug_default_n_synth: 100
 rpt_aug_n_synth_per_batch: null
+rpt_aug_inject_to_ce: true
+rpt_aug_score_mode: uniform        # uniform | selection_scores
 rpt_aug_weighted_sampling: true
+rpt_aug_clip_factor: 3.0
 rpt_aug_cov_eps: 1.0e-6
 rpt_aug_cov_estimator: sample      # sample | oas | lw
 rpt_aug_cov_shrinkage: 0.0
@@ -179,7 +303,23 @@ models:
     learning_rate: 0.00005
     cosine_t_max: 150
 
+  DSANCCL:
+    learning_rate: 0.0001
+    cosine_t_max: 150
+
   EEGNet:
+    learning_rate: 0.001
+    cosine_t_max: 150
+
+  EEGNetAuxTS:
+    learning_rate: 0.001
+    cosine_t_max: 150
+
+  EEGNetDualHead:
+    learning_rate: 0.001
+    cosine_t_max: 150
+
+  EEGNetTS:
     learning_rate: 0.001
     cosine_t_max: 150
 
@@ -188,7 +328,7 @@ models:
     cosine_t_max: 150
 
   EEGInception:
-    learning_rate: 0.001
+    learning_rate: 0.0001
     cosine_t_max: 150
 
   EEGConformer:

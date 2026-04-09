@@ -1,6 +1,10 @@
 # 忽略 Experiment 和 EEG_Analysis 文件夹
 /Experiments/
 /EEG_Analysis/
+/Cache/
+/Configs/archive/
+/nohup.out
+/*.nohup.out
 
 # 忽略项目根目录下的 .jpg, .png 和 .log 文件（只忽略根目录的这些类型文件）
 /*.jpg
