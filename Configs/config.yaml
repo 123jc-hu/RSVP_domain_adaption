@@ -23,24 +23,6 @@ class_weighted_ce: true
 ea_enable: false
 ea_cov_eps: 1.0e-6
 
-# Optional fold-level Riemannian Spatial Filtering preprocessing
-rsf_enable: false
-rsf_mode: plain
-rsf_dim: 8
-rsf_cov_estimator: lwf
-rsf_solver: trust-constr
-rsf_maxiter: 1000
-rsf_tolerance: 1.0e-8
-rsf_domain_lambda: 0.0
-rsf_fit_max_trials_per_class_per_subject: null
-rsf_fit_balance_classes: false
-
-# Optional unbalanced optimal transport alignment
-uot_eps: 0.1
-uot_tau_source: 1.0
-uot_tau_target: 1.0
-uot_max_iter: 30
-
 # Optional source-train background downsampling
 # Applied only to source train split after train/val split; val/test untouched.
 source_train_bg_downsample_enable: false
@@ -103,48 +85,6 @@ dsan_pool_stride: 7
 dsan_feature_dim: 1024
 dsan_classifier_hidden_dim: 512
 dsan_dropout: 0.5
-
-# EEGNet tangent-space head controls
-eegnet_ts_cov_eps: 1.0e-4
-eegnet_ts_cov_shrinkage_alpha: 0.0
-eegnet_ts_head_channels: 16
-eegnet_ts_feature_layer: block2
-eegnet_dual_output_mode: fusion
-eegnet_dual_fusion_flat_weight: 0.7
-eegnet_dual_lambda_flat_ce: 0.0
-eegnet_dual_lambda_ts_ce: 0.0
-eegnet_aux_ts_lambda_align: 0.0
-
-# Source-only prototype regularization
-prototype_enable: false
-prototype_lambda: 0.0
-prototype_momentum: 0.9
-prototype_positive_weight: 1.0
-prototype_background_weight: 1.0
-prototype_positive_label: 1
-prototype_background_label: 0
-prototype_separation_lambda: 0.0
-prototype_separation_margin: 1.0
-
-# Positive-only distribution regularization
-posdist_enable: false
-posdist_lambda: 0.0
-posdist_start_epoch: 0
-posdist_var_weight: 1.0
-posdist_momentum: 0.9
-posdist_positive_label: 1
-
-# Latent style adapter controls
-lsa_content_lambda: 0.0
-lsa_identity_lambda: 0.0
-lsa_style_momentum: 0.1
-lsa_init_gate: 0.1
-lsa_target_blend_alpha: 0.1
-lsa_similarity_tau: 1.0
-lsa_var_distance_weight: 1.0
-gsldsa_target_blend_alpha: 0.1
-gsldsa_var_distance_weight: 1.0
-dgldsa_target_blend_alpha: 0.1
 
 # DA framework switches (scaffold stage)
 use_target_stream: false
@@ -303,23 +243,7 @@ models:
     learning_rate: 0.00005
     cosine_t_max: 150
 
-  DSANCCL:
-    learning_rate: 0.0001
-    cosine_t_max: 150
-
   EEGNet:
-    learning_rate: 0.001
-    cosine_t_max: 150
-
-  EEGNetAuxTS:
-    learning_rate: 0.001
-    cosine_t_max: 150
-
-  EEGNetDualHead:
-    learning_rate: 0.001
-    cosine_t_max: 150
-
-  EEGNetTS:
     learning_rate: 0.001
     cosine_t_max: 150
 

@@ -6,7 +6,6 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from Data.npz_io import ensure_npz_cache, ensure_subject_ea_cache
-from Data.rsf_preprocessing import ensure_rsf_fold_cache
 from Data.source_selection import (
     SelectionManager,
     normalize_score_map,
@@ -650,6 +649,7 @@ class EEGDataModuleCrossSubject:
                 class_counts += np.bincount(labels.astype(np.int64), minlength=n_class)
 
         if self._use_rsf():
+            from Data.rsf_preprocessing import ensure_rsf_fold_cache
             cache_info = ensure_rsf_fold_cache(
                 config=self.config,
                 subject_file_map=self.subject_file_map,

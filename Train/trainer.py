@@ -164,7 +164,6 @@ class OptimizedExperimentRunner:
             benchmark=bool(self.config.get("cudnn_benchmark", False)),
             matmul_precision=str(self.config.get("matmul_precision", "highest")),
         )
-        self.log.info(f"HyR-DPA switches | {self.hyr_dpa.describe()}")
         self.log.info(f"Experiment summary | {self._experiment_summary()}")
 
         self.runtime_records = []
@@ -320,53 +319,6 @@ class OptimizedExperimentRunner:
                 f"bg_to_pos_ratio={float(cfg.get('source_train_bg_downsample_bg_to_pos_ratio', 0.0))}"
             )
 
-        if bool(cfg.get("rsf_enable", False)):
-            parts.extend(
-                [
-                    f"rsf_mode={str(cfg.get('rsf_mode', 'plain')).strip().lower()}",
-                    f"rsf_dim={int(cfg.get('rsf_dim', cfg.get('n_channels', 0)))}",
-                    f"rsf_cov_estimator={str(cfg.get('rsf_cov_estimator', 'lwf')).strip().lower()}",
-                    f"rsf_solver={str(cfg.get('rsf_solver', 'trust-constr')).strip()}",
-                    f"rsf_domain_lambda={float(cfg.get('rsf_domain_lambda', 0.0))}",
-                    f"rsf_fit_max_trials_per_class_per_subject={cfg.get('rsf_fit_max_trials_per_class_per_subject', 'all')}",
-                    f"rsf_fit_balance_classes={bool(cfg.get('rsf_fit_balance_classes', False))}",
-                ]
-            )
-
-        if bool(cfg.get("prototype_enable", False)):
-            parts.extend(
-                [
-                    f"prototype_lambda={float(cfg.get('prototype_lambda', 0.0))}",
-                    f"prototype_momentum={float(cfg.get('prototype_momentum', 0.9))}",
-                    f"prototype_positive_weight={float(cfg.get('prototype_positive_weight', 1.0))}",
-                    f"prototype_background_weight={float(cfg.get('prototype_background_weight', 1.0))}",
-                    f"prototype_separation_lambda={float(cfg.get('prototype_separation_lambda', 0.0))}",
-                    f"prototype_separation_margin={float(cfg.get('prototype_separation_margin', 1.0))}",
-                ]
-            )
-
-        if bool(cfg.get("posdist_enable", False)):
-            parts.extend(
-                [
-                    f"posdist_lambda={float(cfg.get('posdist_lambda', 0.0))}",
-                    f"posdist_start_epoch={int(cfg.get('posdist_start_epoch', 0))}",
-                    f"posdist_var_weight={float(cfg.get('posdist_var_weight', 1.0))}",
-                    f"posdist_momentum={float(cfg.get('posdist_momentum', 0.9))}",
-                    f"posdist_positive_label={int(cfg.get('posdist_positive_label', 1))}",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetTS":
-            parts.extend(
-                [
-                    f"ts_feature_layer={cfg.get('eegnet_ts_feature_layer', 'block2')}",
-                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
-                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
-                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
-                    "ts_block2_activation=ELU(fixed)",
-                ]
-            )
-
         if str(cfg.get("model", "")).strip() == "EEGNetDSBN":
             parts.extend(
                 [
@@ -397,83 +349,6 @@ class OptimizedExperimentRunner:
                     f"swldsa_var_distance_weight={float(cfg.get('swldsa_var_distance_weight', 1.0))}",
                 ]
             )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetGSLDSA":
-            parts.extend(
-                [
-                    "gsldsa_layer=block2_bn",
-                    "gsldsa_affine=shared",
-                    "gsldsa_target_stats=golden_subject_blended",
-                    f"gsldsa_target_blend_alpha={float(cfg.get('gsldsa_target_blend_alpha', 0.1))}",
-                    f"gsldsa_var_distance_weight={float(cfg.get('gsldsa_var_distance_weight', 1.0))}",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetDGLDSA":
-            parts.extend(
-                [
-                    "dgldsa_layer=block2_bn",
-                    "dgldsa_affine=shared",
-                    "dgldsa_target_stats=discriminability_anchor_blended",
-                    f"dgldsa_target_blend_alpha={float(cfg.get('dgldsa_target_blend_alpha', 0.1))}",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetLSA":
-            parts.extend(
-                [
-                    "lsa_layer=block2_feature",
-                    "lsa_style_transfer=adain_like_target_only",
-                    f"lsa_content_lambda={float(cfg.get('lsa_content_lambda', 0.0))}",
-                    f"lsa_style_momentum={float(cfg.get('lsa_style_momentum', 0.1))}",
-                    f"lsa_init_gate={float(cfg.get('lsa_init_gate', 0.5))}",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetLSAv2":
-            parts.extend(
-                [
-                    "lsa_v2_layer=block2_feature",
-                    "lsa_v2_style_transfer=similarity_weighted_adain",
-                    f"lsa_content_lambda={float(cfg.get('lsa_content_lambda', 0.0))}",
-                    f"lsa_identity_lambda={float(cfg.get('lsa_identity_lambda', 0.0))}",
-                    f"lsa_style_momentum={float(cfg.get('lsa_style_momentum', 0.1))}",
-                    f"lsa_init_gate={float(cfg.get('lsa_init_gate', 0.1))}",
-                    f"lsa_target_blend_alpha={float(cfg.get('lsa_target_blend_alpha', 0.1))}",
-                    f"lsa_similarity_tau={float(cfg.get('lsa_similarity_tau', 1.0))}",
-                    f"lsa_var_distance_weight={float(cfg.get('lsa_var_distance_weight', 1.0))}",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetAuxTS":
-            parts.extend(
-                [
-                    f"aux_ts_lambda_align={float(cfg.get('eegnet_aux_ts_lambda_align', 0.0))}",
-                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
-                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
-                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
-                    "ts_branch_alignment=global_mmd_aux_only",
-                    "shared_block2_activation=ELU(fixed)",
-                ]
-            )
-
-        if str(cfg.get("model", "")).strip() == "EEGNetDualHead":
-            parts.extend(
-                [
-                    f"dual_output_mode={str(cfg.get('eegnet_dual_output_mode', 'fusion')).strip().lower()}",
-                    f"dual_fusion_flat_weight={float(cfg.get('eegnet_dual_fusion_flat_weight', 0.7))}",
-                    f"dual_fusion_ts_weight={1.0 - float(cfg.get('eegnet_dual_fusion_flat_weight', 0.7))}",
-                    f"dual_lambda_flat_ce={float(cfg.get('eegnet_dual_lambda_flat_ce', 0.0))}",
-                    f"dual_lambda_ts_ce={float(cfg.get('eegnet_dual_lambda_ts_ce', 0.0))}",
-                    f"ts_head_channels={int(cfg.get('eegnet_ts_head_channels', 16))}",
-                    f"ts_cov_eps={float(cfg.get('eegnet_ts_cov_eps', 1.0e-4))}",
-                    f"ts_cov_shrinkage_alpha={float(cfg.get('eegnet_ts_cov_shrinkage_alpha', 0.0))}",
-                    "ts_branch_alignment=off",
-                    "flat_branch_alignment=on",
-                    "shared_block2_activation=ELU(fixed)",
-                ]
-            )
-
         return ", ".join(str(p) for p in parts)
 
     def _fold_source_selection_inputs(
